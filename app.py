@@ -75,7 +75,7 @@ def calcular_estrategia(data, params):
     qtde = params['qtde']
     posicao = params['posicao']
     tipo = params['tipo']
-    premio_pct = params['premio_pct'] / 100.0
+    premio_pct_perna = params['premio_pct'] / 100.0  # Custo POR PERNA
     dist_strike_pct = params['dist_strike'] / 100.0
     dias_hold = params['dias_hold']
     
@@ -91,8 +91,7 @@ def calcular_estrategia(data, params):
     if not col_preco:
         return None, "Coluna de preço não encontrada."
 
-    # Filtra período de simulação (respeitando inputs do usuário)
-    # Precisamos garantir que a data de entrada esteja dentro do intervalo escolhido
+    # Filtra período
     mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
     data_sim = data.loc[mask]
     
@@ -102,76 +101,78 @@ def calcular_estrategia(data, params):
     trades = []
     prejuizo_acumulado = 0.0
     
-    # Loop de Simulação
-    # Iteramos sobre o dataframe completo, mas só abrimos trades nas datas permitidas
-    # Precisamos do índice original para achar a data de saída correta
     indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
     
     if not indices_possiveis:
         return None, "Intervalo inválido."
 
     ultimo_idx_valido = len(data) - dias_hold
-    
-    # Pulo (Step) = dias_hold para não sobrepor operações (simplificação)
-    # Se quiser trades diários, mudar step para 1 (mas gera sobreposição complexa)
     current_idx = indices_possiveis[0]
     
     while current_idx < ultimo_idx_valido:
-        # Verifica se a data atual ainda está dentro do limite final do usuário
         if data.index[current_idx].date() > params['fim']:
             break
             
         try:
-            # Entrada
+            # Dados de Mercado
             entry_date = data.index[current_idx]
             entry_price = float(data[col_preco].iloc[current_idx])
             
-            # Saída
             exit_idx = current_idx + dias_hold
             exit_date = data.index[exit_idx]
             exit_price = float(data[col_preco].iloc[exit_idx])
             
-            # Strikes
+            # Definição dos Strikes
             strike_call = entry_price * (1 + dist_strike_pct)
             strike_put = entry_price * (1 - dist_strike_pct)
             
-            # Payoff Unitário
-            exercicio_call = exit_price > strike_call
-            exercicio_put = exit_price < strike_put
-            
-            payoff_call_unit = max(0, exit_price - strike_call)
-            payoff_put_unit = max(0, strike_put - exit_price)
-            
-            # Financeiro Total (Lote)
-            premio_total = (entry_price * premio_pct) * qtde
-            custo_entrada = premio_total * taxa_entrada
-            
-            payoff_total = 0.0
-            custo_exercicio = 0.0
-            
-            # Lógica das Opções
+            # Definição de Quais Pernas Usar
             usar_call = 'Call' in tipo or 'Straddle' in tipo
             usar_put = 'Put' in tipo or 'Straddle' in tipo
             
+            # --- CÁLCULO DE CUSTOS (CORRIGIDO) ---
+            financeiro_premio_total = 0.0
+            
+            # Custo Call (se ativa)
             if usar_call:
+                custo_call = (entry_price * premio_pct_perna) * qtde
+                financeiro_premio_total += custo_call
+            
+            # Custo Put (se ativa)
+            if usar_put:
+                custo_put = (entry_price * premio_pct_perna) * qtde
+                financeiro_premio_total += custo_put
+            
+            # Taxa de Entrada (incide sobre o prêmio total pago/recebido)
+            custo_entrada = financeiro_premio_total * taxa_entrada
+            
+            # --- CÁLCULO DE PAYOFF E EXERCÍCIO ---
+            payoff_total = 0.0
+            custo_exercicio = 0.0
+            
+            if usar_call:
+                payoff_call_unit = max(0, exit_price - strike_call)
                 payoff_total += payoff_call_unit * qtde
-                if exercicio_call:
+                if exit_price > strike_call: # Exercício
                     custo_exercicio += (strike_call * qtde) * taxa_exercicio
             
             if usar_put:
+                payoff_put_unit = max(0, strike_put - exit_price)
                 payoff_total += payoff_put_unit * qtde
-                if exercicio_put:
+                if exit_price < strike_put: # Exercício
                     custo_exercicio += (strike_put * qtde) * taxa_exercicio
             
             custos_totais = custo_entrada + custo_exercicio
             
-            # Resultado Operacional
+            # --- RESULTADO OPERACIONAL ---
             if posicao == 'Comprado (Titular)':
-                res_op = payoff_total - premio_total - custos_totais
-            else:
-                res_op = premio_total - payoff_total - custos_totais
+                # Lucro = O que recebeu no final (Payoff) - O que pagou no início (Prêmio) - Custos
+                res_op = payoff_total - financeiro_premio_total - custos_totais
+            else: # Vendido
+                # Lucro = O que recebeu no início (Prêmio) - O que pagou no final (Payoff) - Custos
+                res_op = financeiro_premio_total - payoff_total - custos_totais
                 
-            # IR (Compensação)
+            # IR (Compensação de Prejuízo)
             ir = 0.0
             if res_op > 0:
                 lucro_real = max(0, res_op - prejuizo_acumulado)
@@ -188,7 +189,7 @@ def calcular_estrategia(data, params):
                 'Preço Ent.': entry_price,
                 'Saída': exit_date,
                 'Preço Sai.': exit_price,
-                'Prêmio': premio_total,
+                'Prêmio': financeiro_premio_total,
                 'Custos': custos_totais,
                 'Res. Oper.': res_op,
                 'IR': ir,
@@ -198,7 +199,6 @@ def calcular_estrategia(data, params):
         except Exception:
             pass
         
-        # Avança para o próximo trade
         current_idx += dias_hold
         
     return pd.DataFrame(trades), None
@@ -226,7 +226,9 @@ fim = col_dt2.date_input("Fim", dt_hoje)
 # 4. Parâmetros Opção
 st.sidebar.markdown("---")
 dias_hold = st.sidebar.slider("Dias Úteis (Vencimento)", 5, 120, 20, help="Duração da operação em pregões.")
-premio_pct = st.sidebar.slider("Prêmio Opção (% do Ativo)", 0.1, 15.0, 4.0, step=0.1)
+
+# AJUSTE NA DESCRIÇÃO DO SLIDER
+premio_pct = st.sidebar.slider("Prêmio POR PERNA (% do Ativo)", 0.1, 15.0, 3.0, step=0.1, help="Custo unitário da Call e da Put. No Straddle, esse valor será duplicado.")
 dist_strike = st.sidebar.slider("Distância Strike (%)", 0.0, 20.0, 0.0, step=0.5)
 
 # Botão de Execução
@@ -257,7 +259,10 @@ if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
             else:
                 # --- DASHBOARD DE RESULTADOS ---
                 st.subheader(f"Resultado: {ticker} ({qtde} un.)")
-                st.markdown(f"**Estratégia:** {posicao} em {tipo} | **Custo:** {premio_pct}% | **Prazo:** {dias_hold} dias")
+                
+                # Exibe custo total estimado na legenda
+                custo_total_legenda = premio_pct * 2 if 'Straddle' in tipo else premio_pct
+                st.markdown(f"**Estratégia:** {posicao} em {tipo} | **Custo Total Estimado:** {custo_total_legenda:.1f}% ({premio_pct}% por perna) | **Prazo:** {dias_hold} dias")
                 
                 total_liq = df_result['Líquido'].sum()
                 total_custos = df_result['Custos'].sum()
@@ -265,7 +270,6 @@ if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
                 acertos = len(df_result[df_result['Res. Oper.'] > 0])
                 win_rate = (acertos / len(df_result)) * 100
                 
-                # HTML Cards
                 cor_saldo = "positive" if total_liq > 0 else "negative"
                 
                 html_code = f"""
@@ -293,15 +297,12 @@ if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
                 # --- TABELA DETALHADA ---
                 st.markdown("### 📋 Extrato Financeiro")
                 
-                # Formatação para exibição
                 df_show = df_result.copy()
                 df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%Y')
                 df_show['Saída'] = df_show['Saída'].dt.strftime('%d/%m/%Y')
                 
-                # Colunas numéricas para formatação
                 cols_num = ['Preço Ent.', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'IR', 'Líquido']
                 
-                # Configuração da Tabela no Streamlit
                 st.dataframe(
                     df_show.style.format({c: 'R$ {:.2f}' for c in cols_num})
                            .map(lambda x: 'color: green;' if x > 0 else 'color: red;', subset=['Res. Oper.', 'Líquido']),
@@ -309,7 +310,6 @@ if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
                     height=500
                 )
                 
-                # Botão de Download CSV
                 csv = df_result.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 Baixar Resultados em CSV",
