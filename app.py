@@ -1,1 +1,322 @@
-{"nbformat":4,"nbformat_minor":0,"metadata":{"colab":{"provenance":[],"authorship_tag":"ABX9TyNCcEpRMWJH1naJnPdmz5w7"},"kernelspec":{"name":"python3","display_name":"Python 3"},"language_info":{"name":"python"}},"cells":[{"cell_type":"code","execution_count":null,"metadata":{"id":"fx4SedkoRlXr"},"outputs":[],"source":["import streamlit as st\n","import yfinance as yf\n","import pandas as pd\n","from datetime import date, timedelta\n","import warnings\n","\n","# Configuração da Página\n","st.set_page_config(\n","    page_title=\"Simulador de Opções B3\",\n","    page_icon=\"💰\",\n","    layout=\"wide\"\n",")\n","\n","# Ignorar avisos de versão\n","warnings.simplefilter(action='ignore', category=FutureWarning)\n","\n","# --- CSS CUSTOMIZADO PARA OS CARDS ---\n","st.markdown(\"\"\"\n","<style>\n","    .metric-card {\n","        background-color: #f8f9fa;\n","        border: 1px solid #dee2e6;\n","        padding: 20px;\n","        border-radius: 10px;\n","        text-align: center;\n","        box-shadow: 2px 2px 5px rgba(0,0,0,0.05);\n","    }\n","    .metric-label {\n","        font-size: 14px;\n","        color: #6c757d;\n","        text-transform: uppercase;\n","        font-weight: 600;\n","    }\n","    .metric-value {\n","        font-size: 26px;\n","        font-weight: bold;\n","        margin-top: 5px;\n","    }\n","    .positive { color: #28a745; }\n","    .negative { color: #dc3545; }\n","    .neutral { color: #6c757d; }\n","    .warning { color: #ffc107; }\n","</style>\n","\"\"\", unsafe_allow_html=True)\n","\n","# --- FUNÇÕES DE DADOS (COM CACHE) ---\n","@st.cache_data(ttl=3600)\n","def baixar_dados(ticker, inicio, fim):\n","    \"\"\"Baixa dados do Yahoo Finance com cache para performance.\"\"\"\n","    try:\n","        # Adiciona margem de segurança para garantir fechamento dos candles futuros\n","        fim_ajustado = fim + timedelta(days=200)\n","        df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)\n","\n","        # Limpeza de MultiIndex (Correção Yahoo)\n","        if df.empty: return df\n","        if isinstance(df.columns, pd.MultiIndex):\n","            try:\n","                df.columns = df.columns.get_level_values('Price')\n","            except:\n","                df.columns = df.columns.get_level_values(0)\n","\n","        # Remove timezone\n","        if df.index.tz is not None:\n","            df.index = df.index.tz_localize(None)\n","\n","        return df\n","    except Exception as e:\n","        st.error(f\"Erro ao baixar dados: {e}\")\n","        return pd.DataFrame()\n","\n","# --- MOTOR DE CÁLCULO ---\n","def calcular_estrategia(data, params):\n","    ticker = params['ticker']\n","    qtde = params['qtde']\n","    posicao = params['posicao']\n","    tipo = params['tipo']\n","    premio_pct = params['premio_pct'] / 100.0\n","    dist_strike_pct = params['dist_strike'] / 100.0\n","    dias_hold = params['dias_hold']\n","\n","    # Taxas B3 / Corretagem\n","    taxa_entrada = 0.005  # 0.5% sobre o prêmio\n","    taxa_exercicio = 0.005 # 0.5% sobre o strike (notional)\n","    ir_aliquota = 0.15\n","\n","    col_preco = 'Close'\n","    if 'Close' not in data.columns:\n","        col_preco = 'Adj Close' if 'Adj Close' in data.columns else None\n","\n","    if not col_preco:\n","        return None, \"Coluna de preço não encontrada.\"\n","\n","    # Filtra período de simulação (respeitando inputs do usuário)\n","    # Precisamos garantir que a data de entrada esteja dentro do intervalo escolhido\n","    mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])\n","    data_sim = data.loc[mask]\n","\n","    if len(data_sim) == 0:\n","        return None, \"Sem dados no período selecionado.\"\n","\n","    trades = []\n","    prejuizo_acumulado = 0.0\n","\n","    # Loop de Simulação\n","    # Iteramos sobre o dataframe completo, mas só abrimos trades nas datas permitidas\n","    # Precisamos do índice original para achar a data de saída correta\n","    indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]\n","\n","    if not indices_possiveis:\n","        return None, \"Intervalo inválido.\"\n","\n","    ultimo_idx_valido = len(data) - dias_hold\n","\n","    # Pulo (Step) = dias_hold para não sobrepor operações (simplificação)\n","    # Se quiser trades diários, mudar step para 1 (mas gera sobreposição complexa)\n","    current_idx = indices_possiveis[0]\n","\n","    while current_idx < ultimo_idx_valido:\n","        # Verifica se a data atual ainda está dentro do limite final do usuário\n","        if data.index[current_idx].date() > params['fim']:\n","            break\n","\n","        try:\n","            # Entrada\n","            entry_date = data.index[current_idx]\n","            entry_price = float(data[col_preco].iloc[current_idx])\n","\n","            # Saída\n","            exit_idx = current_idx + dias_hold\n","            exit_date = data.index[exit_idx]\n","            exit_price = float(data[col_preco].iloc[exit_idx])\n","\n","            # Strikes\n","            strike_call = entry_price * (1 + dist_strike_pct)\n","            strike_put = entry_price * (1 - dist_strike_pct)\n","\n","            # Payoff Unitário\n","            exercicio_call = exit_price > strike_call\n","            exercicio_put = exit_price < strike_put\n","\n","            payoff_call_unit = max(0, exit_price - strike_call)\n","            payoff_put_unit = max(0, strike_put - exit_price)\n","\n","            # Financeiro Total (Lote)\n","            premio_total = (entry_price * premio_pct) * qtde\n","            custo_entrada = premio_total * taxa_entrada\n","\n","            payoff_total = 0.0\n","            custo_exercicio = 0.0\n","\n","            # Lógica das Opções\n","            usar_call = 'Call' in tipo or 'Straddle' in tipo\n","            usar_put = 'Put' in tipo or 'Straddle' in tipo\n","\n","            if usar_call:\n","                payoff_total += payoff_call_unit * qtde\n","                if exercicio_call:\n","                    custo_exercicio += (strike_call * qtde) * taxa_exercicio\n","\n","            if usar_put:\n","                payoff_total += payoff_put_unit * qtde\n","                if exercicio_put:\n","                    custo_exercicio += (strike_put * qtde) * taxa_exercicio\n","\n","            custos_totais = custo_entrada + custo_exercicio\n","\n","            # Resultado Operacional\n","            if posicao == 'Comprado (Titular)':\n","                res_op = payoff_total - premio_total - custos_totais\n","            else:\n","                res_op = premio_total - payoff_total - custos_totais\n","\n","            # IR (Compensação)\n","            ir = 0.0\n","            if res_op > 0:\n","                lucro_real = max(0, res_op - prejuizo_acumulado)\n","                abatimento = res_op - lucro_real\n","                prejuizo_acumulado -= abatimento\n","                ir = lucro_real * ir_aliquota\n","            else:\n","                prejuizo_acumulado += abs(res_op)\n","\n","            liquido = res_op - ir\n","\n","            trades.append({\n","                'Entrada': entry_date,\n","                'Preço Ent.': entry_price,\n","                'Saída': exit_date,\n","                'Preço Sai.': exit_price,\n","                'Prêmio': premio_total,\n","                'Custos': custos_totais,\n","                'Res. Oper.': res_op,\n","                'IR': ir,\n","                'Líquido': liquido\n","            })\n","\n","        except Exception:\n","            pass\n","\n","        # Avança para o próximo trade\n","        current_idx += dias_hold\n","\n","    return pd.DataFrame(trades), None\n","\n","# --- INTERFACE ---\n","\n","st.sidebar.header(\"⚙️ Parâmetros\")\n","\n","# 1. Ativo e Lote\n","ticker = st.sidebar.text_input(\"Ticker (com .SA)\", \"PETR4.SA\").upper().strip()\n","qtde = st.sidebar.number_input(\"Tamanho do Lote\", min_value=100, value=1000, step=100)\n","\n","# 2. Configuração\n","st.sidebar.markdown(\"---\")\n","posicao = st.sidebar.selectbox(\"Sua Posição\", ['Comprado (Titular)', 'Vendido (Lançador)'])\n","tipo = st.sidebar.selectbox(\"Estratégia\", ['Call + Put (Straddle)', 'Apenas Call', 'Apenas Put'])\n","\n","# 3. Datas\n","st.sidebar.markdown(\"---\")\n","col_dt1, col_dt2 = st.sidebar.columns(2)\n","dt_hoje = date.today()\n","inicio = col_dt1.date_input(\"Início\", dt_hoje - timedelta(days=365))\n","fim = col_dt2.date_input(\"Fim\", dt_hoje)\n","\n","# 4. Parâmetros Opção\n","st.sidebar.markdown(\"---\")\n","dias_hold = st.sidebar.slider(\"Dias Úteis (Vencimento)\", 5, 120, 20, help=\"Duração da operação em pregões.\")\n","premio_pct = st.sidebar.slider(\"Prêmio Opção (% do Ativo)\", 0.1, 15.0, 4.0, step=0.1)\n","dist_strike = st.sidebar.slider(\"Distância Strike (%)\", 0.0, 20.0, 0.0, step=0.5)\n","\n","# Botão de Execução\n","if st.sidebar.button(\"🚀 Rodar Simulação\", type=\"primary\"):\n","\n","    if inicio >= fim:\n","        st.error(\"Data de início deve ser anterior ao fim.\")\n","    else:\n","        with st.spinner(f\"Baixando dados de {ticker}...\"):\n","            df_dados = baixar_dados(ticker, inicio, fim)\n","\n","        if df_dados.empty:\n","            st.error(\"Não foi possível baixar dados para este ativo.\")\n","        else:\n","            params = {\n","                'ticker': ticker, 'qtde': qtde, 'posicao': posicao,\n","                'tipo': tipo, 'inicio': inicio, 'fim': fim,\n","                'dias_hold': dias_hold, 'premio_pct': premio_pct,\n","                'dist_strike': dist_strike\n","            }\n","\n","            df_result, erro = calcular_estrategia(df_dados, params)\n","\n","            if erro:\n","                st.warning(erro)\n","            elif df_result.empty:\n","                st.warning(\"Nenhuma operação concluída no período (verifique as datas).\")\n","            else:\n","                # --- DASHBOARD DE RESULTADOS ---\n","                st.subheader(f\"Resultado: {ticker} ({qtde} un.)\")\n","                st.markdown(f\"**Estratégia:** {posicao} em {tipo} | **Custo:** {premio_pct}% | **Prazo:** {dias_hold} dias\")\n","\n","                total_liq = df_result['Líquido'].sum()\n","                total_custos = df_result['Custos'].sum()\n","                total_ir = df_result['IR'].sum()\n","                acertos = len(df_result[df_result['Res. Oper.'] > 0])\n","                win_rate = (acertos / len(df_result)) * 100\n","\n","                # HTML Cards\n","                cor_saldo = \"positive\" if total_liq > 0 else \"negative\"\n","\n","                html_code = f\"\"\"\n","                <div style=\"display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap;\">\n","                    <div class=\"metric-card\" style=\"flex: 1; min-width: 150px;\">\n","                        <div class=\"metric-label\">Resultado Líquido</div>\n","                        <div class=\"metric-value {cor_saldo}\">R$ {total_liq:,.2f}</div>\n","                    </div>\n","                    <div class=\"metric-card\" style=\"flex: 1; min-width: 150px;\">\n","                        <div class=\"metric-label\">Custos B3/Corretagem</div>\n","                        <div class=\"metric-value warning\">R$ {total_custos:,.2f}</div>\n","                    </div>\n","                    <div class=\"metric-card\" style=\"flex: 1; min-width: 150px;\">\n","                        <div class=\"metric-label\">IR Pago (15%)</div>\n","                        <div class=\"metric-value negative\">R$ {total_ir:,.2f}</div>\n","                    </div>\n","                    <div class=\"metric-card\" style=\"flex: 1; min-width: 150px;\">\n","                        <div class=\"metric-label\">Taxa de Acerto</div>\n","                        <div class=\"metric-value neutral\">{win_rate:.1f}%</div>\n","                    </div>\n","                </div>\n","                \"\"\"\n","                st.markdown(html_code, unsafe_allow_html=True)\n","\n","                # --- TABELA DETALHADA ---\n","                st.markdown(\"### 📋 Extrato Financeiro\")\n","\n","                # Formatação para exibição\n","                df_show = df_result.copy()\n","                df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%Y')\n","                df_show['Saída'] = df_show['Saída'].dt.strftime('%d/%m/%Y')\n","\n","                # Colunas numéricas para formatação\n","                cols_num = ['Preço Ent.', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'IR', 'Líquido']\n","\n","                # Configuração da Tabela no Streamlit\n","                st.dataframe(\n","                    df_show.style.format({c: 'R$ {:.2f}' for c in cols_num})\n","                           .map(lambda x: 'color: green;' if x > 0 else 'color: red;', subset=['Res. Oper.', 'Líquido']),\n","                    use_container_width=True,\n","                    height=500\n","                )\n","\n","                # Botão de Download CSV\n","                csv = df_result.to_csv(index=False).encode('utf-8')\n","                st.download_button(\n","                    label=\"📥 Baixar Resultados em CSV\",\n","                    data=csv,\n","                    file_name=f'backtest_{ticker}_{date.today()}.csv',\n","                    mime='text/csv',\n","                )\n","\n","else:\n","    st.info(\"👈 Configure os parâmetros na barra lateral e clique em 'Rodar Simulação'.\")"]}]}
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+from datetime import date, timedelta
+import warnings
+
+# Configuração da Página
+st.set_page_config(
+    page_title="Simulador de Opções B3",
+    page_icon="💰",
+    layout="wide"
+)
+
+# Ignorar avisos de versão
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# --- CSS CUSTOMIZADO PARA OS CARDS ---
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
+    }
+    .metric-label {
+        font-size: 14px;
+        color: #6c757d;
+        text-transform: uppercase;
+        font-weight: 600;
+    }
+    .metric-value {
+        font-size: 26px;
+        font-weight: bold;
+        margin-top: 5px;
+    }
+    .positive { color: #28a745; }
+    .negative { color: #dc3545; }
+    .neutral { color: #6c757d; }
+    .warning { color: #ffc107; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- FUNÇÕES DE DADOS (COM CACHE) ---
+@st.cache_data(ttl=3600)
+def baixar_dados(ticker, inicio, fim):
+    """Baixa dados do Yahoo Finance com cache para performance."""
+    try:
+        # Adiciona margem de segurança para garantir fechamento dos candles futuros
+        fim_ajustado = fim + timedelta(days=200)
+        df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)
+        
+        # Limpeza de MultiIndex (Correção Yahoo)
+        if df.empty: return df
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df.columns = df.columns.get_level_values('Price')
+            except:
+                df.columns = df.columns.get_level_values(0)
+        
+        # Remove timezone
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
+        return df
+    except Exception as e:
+        st.error(f"Erro ao baixar dados: {e}")
+        return pd.DataFrame()
+
+# --- MOTOR DE CÁLCULO ---
+def calcular_estrategia(data, params):
+    ticker = params['ticker']
+    qtde = params['qtde']
+    posicao = params['posicao']
+    tipo = params['tipo']
+    premio_pct = params['premio_pct'] / 100.0
+    dist_strike_pct = params['dist_strike'] / 100.0
+    dias_hold = params['dias_hold']
+    
+    # Taxas B3 / Corretagem
+    taxa_entrada = 0.005  # 0.5% sobre o prêmio
+    taxa_exercicio = 0.005 # 0.5% sobre o strike (notional)
+    ir_aliquota = 0.15
+    
+    col_preco = 'Close'
+    if 'Close' not in data.columns:
+        col_preco = 'Adj Close' if 'Adj Close' in data.columns else None
+        
+    if not col_preco:
+        return None, "Coluna de preço não encontrada."
+
+    # Filtra período de simulação (respeitando inputs do usuário)
+    # Precisamos garantir que a data de entrada esteja dentro do intervalo escolhido
+    mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
+    data_sim = data.loc[mask]
+    
+    if len(data_sim) == 0:
+        return None, "Sem dados no período selecionado."
+
+    trades = []
+    prejuizo_acumulado = 0.0
+    
+    # Loop de Simulação
+    # Iteramos sobre o dataframe completo, mas só abrimos trades nas datas permitidas
+    # Precisamos do índice original para achar a data de saída correta
+    indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
+    
+    if not indices_possiveis:
+        return None, "Intervalo inválido."
+
+    ultimo_idx_valido = len(data) - dias_hold
+    
+    # Pulo (Step) = dias_hold para não sobrepor operações (simplificação)
+    # Se quiser trades diários, mudar step para 1 (mas gera sobreposição complexa)
+    current_idx = indices_possiveis[0]
+    
+    while current_idx < ultimo_idx_valido:
+        # Verifica se a data atual ainda está dentro do limite final do usuário
+        if data.index[current_idx].date() > params['fim']:
+            break
+            
+        try:
+            # Entrada
+            entry_date = data.index[current_idx]
+            entry_price = float(data[col_preco].iloc[current_idx])
+            
+            # Saída
+            exit_idx = current_idx + dias_hold
+            exit_date = data.index[exit_idx]
+            exit_price = float(data[col_preco].iloc[exit_idx])
+            
+            # Strikes
+            strike_call = entry_price * (1 + dist_strike_pct)
+            strike_put = entry_price * (1 - dist_strike_pct)
+            
+            # Payoff Unitário
+            exercicio_call = exit_price > strike_call
+            exercicio_put = exit_price < strike_put
+            
+            payoff_call_unit = max(0, exit_price - strike_call)
+            payoff_put_unit = max(0, strike_put - exit_price)
+            
+            # Financeiro Total (Lote)
+            premio_total = (entry_price * premio_pct) * qtde
+            custo_entrada = premio_total * taxa_entrada
+            
+            payoff_total = 0.0
+            custo_exercicio = 0.0
+            
+            # Lógica das Opções
+            usar_call = 'Call' in tipo or 'Straddle' in tipo
+            usar_put = 'Put' in tipo or 'Straddle' in tipo
+            
+            if usar_call:
+                payoff_total += payoff_call_unit * qtde
+                if exercicio_call:
+                    custo_exercicio += (strike_call * qtde) * taxa_exercicio
+            
+            if usar_put:
+                payoff_total += payoff_put_unit * qtde
+                if exercicio_put:
+                    custo_exercicio += (strike_put * qtde) * taxa_exercicio
+            
+            custos_totais = custo_entrada + custo_exercicio
+            
+            # Resultado Operacional
+            if posicao == 'Comprado (Titular)':
+                res_op = payoff_total - premio_total - custos_totais
+            else:
+                res_op = premio_total - payoff_total - custos_totais
+                
+            # IR (Compensação)
+            ir = 0.0
+            if res_op > 0:
+                lucro_real = max(0, res_op - prejuizo_acumulado)
+                abatimento = res_op - lucro_real
+                prejuizo_acumulado -= abatimento
+                ir = lucro_real * ir_aliquota
+            else:
+                prejuizo_acumulado += abs(res_op)
+                
+            liquido = res_op - ir
+            
+            trades.append({
+                'Entrada': entry_date,
+                'Preço Ent.': entry_price,
+                'Saída': exit_date,
+                'Preço Sai.': exit_price,
+                'Prêmio': premio_total,
+                'Custos': custos_totais,
+                'Res. Oper.': res_op,
+                'IR': ir,
+                'Líquido': liquido
+            })
+            
+        except Exception:
+            pass
+        
+        # Avança para o próximo trade
+        current_idx += dias_hold
+        
+    return pd.DataFrame(trades), None
+
+# --- INTERFACE ---
+
+st.sidebar.header("⚙️ Parâmetros")
+
+# 1. Ativo e Lote
+ticker = st.sidebar.text_input("Ticker (com .SA)", "PETR4.SA").upper().strip()
+qtde = st.sidebar.number_input("Tamanho do Lote", min_value=100, value=1000, step=100)
+
+# 2. Configuração
+st.sidebar.markdown("---")
+posicao = st.sidebar.selectbox("Sua Posição", ['Comprado (Titular)', 'Vendido (Lançador)'])
+tipo = st.sidebar.selectbox("Estratégia", ['Call + Put (Straddle)', 'Apenas Call', 'Apenas Put'])
+
+# 3. Datas
+st.sidebar.markdown("---")
+col_dt1, col_dt2 = st.sidebar.columns(2)
+dt_hoje = date.today()
+inicio = col_dt1.date_input("Início", dt_hoje - timedelta(days=365))
+fim = col_dt2.date_input("Fim", dt_hoje)
+
+# 4. Parâmetros Opção
+st.sidebar.markdown("---")
+dias_hold = st.sidebar.slider("Dias Úteis (Vencimento)", 5, 120, 20, help="Duração da operação em pregões.")
+premio_pct = st.sidebar.slider("Prêmio Opção (% do Ativo)", 0.1, 15.0, 4.0, step=0.1)
+dist_strike = st.sidebar.slider("Distância Strike (%)", 0.0, 20.0, 0.0, step=0.5)
+
+# Botão de Execução
+if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
+    
+    if inicio >= fim:
+        st.error("Data de início deve ser anterior ao fim.")
+    else:
+        with st.spinner(f"Baixando dados de {ticker}..."):
+            df_dados = baixar_dados(ticker, inicio, fim)
+            
+        if df_dados.empty:
+            st.error("Não foi possível baixar dados para este ativo.")
+        else:
+            params = {
+                'ticker': ticker, 'qtde': qtde, 'posicao': posicao,
+                'tipo': tipo, 'inicio': inicio, 'fim': fim,
+                'dias_hold': dias_hold, 'premio_pct': premio_pct,
+                'dist_strike': dist_strike
+            }
+            
+            df_result, erro = calcular_estrategia(df_dados, params)
+            
+            if erro:
+                st.warning(erro)
+            elif df_result.empty:
+                st.warning("Nenhuma operação concluída no período (verifique as datas).")
+            else:
+                # --- DASHBOARD DE RESULTADOS ---
+                st.subheader(f"Resultado: {ticker} ({qtde} un.)")
+                st.markdown(f"**Estratégia:** {posicao} em {tipo} | **Custo:** {premio_pct}% | **Prazo:** {dias_hold} dias")
+                
+                total_liq = df_result['Líquido'].sum()
+                total_custos = df_result['Custos'].sum()
+                total_ir = df_result['IR'].sum()
+                acertos = len(df_result[df_result['Res. Oper.'] > 0])
+                win_rate = (acertos / len(df_result)) * 100
+                
+                # HTML Cards
+                cor_saldo = "positive" if total_liq > 0 else "negative"
+                
+                html_code = f"""
+                <div style="display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap;">
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">Resultado Líquido</div>
+                        <div class="metric-value {cor_saldo}">R$ {total_liq:,.2f}</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">Custos B3/Corretagem</div>
+                        <div class="metric-value warning">R$ {total_custos:,.2f}</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">IR Pago (15%)</div>
+                        <div class="metric-value negative">R$ {total_ir:,.2f}</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">Taxa de Acerto</div>
+                        <div class="metric-value neutral">{win_rate:.1f}%</div>
+                    </div>
+                </div>
+                """
+                st.markdown(html_code, unsafe_allow_html=True)
+                
+                # --- TABELA DETALHADA ---
+                st.markdown("### 📋 Extrato Financeiro")
+                
+                # Formatação para exibição
+                df_show = df_result.copy()
+                df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%Y')
+                df_show['Saída'] = df_show['Saída'].dt.strftime('%d/%m/%Y')
+                
+                # Colunas numéricas para formatação
+                cols_num = ['Preço Ent.', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'IR', 'Líquido']
+                
+                # Configuração da Tabela no Streamlit
+                st.dataframe(
+                    df_show.style.format({c: 'R$ {:.2f}' for c in cols_num})
+                           .map(lambda x: 'color: green;' if x > 0 else 'color: red;', subset=['Res. Oper.', 'Líquido']),
+                    use_container_width=True,
+                    height=500
+                )
+                
+                # Botão de Download CSV
+                csv = df_result.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Baixar Resultados em CSV",
+                    data=csv,
+                    file_name=f'backtest_{ticker}_{date.today()}.csv',
+                    mime='text/csv',
+                )
+
+else:
+    st.info("👈 Configure os parâmetros na barra lateral e clique em 'Rodar Simulação'.")
