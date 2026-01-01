@@ -1,0 +1,322 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+from datetime import date, timedelta
+import warnings
+
+# Configuração da Página
+st.set_page_config(
+    page_title="Simulador de Opções",
+    page_icon="💰",
+    layout="wide"
+)
+
+# Ignorar avisos de versão
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# --- CSS CUSTOMIZADO PARA OS CARDS ---
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f8f9fa;
+        border: 1px solid #dee2e6;
+        padding: 20px;
+        border-radius: 10px;
+        text-align: center;
+        box-shadow: 2px 2px 5px rgba(0,0,0,0.05);
+    }
+    .metric-label {
+        font-size: 14px;
+        color: #6c757d;
+        text-transform: uppercase;
+        font-weight: 600;
+    }
+    .metric-value {
+        font-size: 26px;
+        font-weight: bold;
+        margin-top: 5px;
+    }
+    .positive { color: #28a745; }
+    .negative { color: #dc3545; }
+    .neutral { color: #6c757d; }
+    .warning { color: #ffc107; }
+</style>
+""", unsafe_allow_html=True)
+
+# --- FUNÇÕES DE DADOS (COM CACHE) ---
+@st.cache_data(ttl=3600)
+def baixar_dados(ticker, inicio, fim):
+    """Baixa dados do Yahoo Finance com cache para performance."""
+    try:
+        # Adiciona margem de segurança para garantir fechamento dos candles futuros
+        fim_ajustado = fim + timedelta(days=200)
+        df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)
+        
+        # Limpeza de MultiIndex (Correção Yahoo)
+        if df.empty: return df
+        if isinstance(df.columns, pd.MultiIndex):
+            try:
+                df.columns = df.columns.get_level_values('Price')
+            except:
+                df.columns = df.columns.get_level_values(0)
+        
+        # Remove timezone
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+            
+        return df
+    except Exception as e:
+        st.error(f"Erro ao baixar dados: {e}")
+        return pd.DataFrame()
+
+# --- MOTOR DE CÁLCULO ---
+def calcular_estrategia(data, params):
+    ticker = params['ticker']
+    qtde = params['qtde']
+    posicao = params['posicao']
+    tipo = params['tipo']
+    premio_pct = params['premio_pct'] / 100.0
+    dist_strike_pct = params['dist_strike'] / 100.0
+    dias_hold = params['dias_hold']
+    
+    # Taxas B3 / Corretagem
+    taxa_entrada = 0.005  # 0.5% sobre o prêmio
+    taxa_exercicio = 0.005 # 0.5% sobre o strike (notional)
+    ir_aliquota = 0.15
+    
+    col_preco = 'Close'
+    if 'Close' not in data.columns:
+        col_preco = 'Adj Close' if 'Adj Close' in data.columns else None
+        
+    if not col_preco:
+        return None, "Coluna de preço não encontrada."
+
+    # Filtra período de simulação (respeitando inputs do usuário)
+    # Precisamos garantir que a data de entrada esteja dentro do intervalo escolhido
+    mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
+    data_sim = data.loc[mask]
+    
+    if len(data_sim) == 0:
+        return None, "Sem dados no período selecionado."
+
+    trades = []
+    prejuizo_acumulado = 0.0
+    
+    # Loop de Simulação
+    # Iteramos sobre o dataframe completo, mas só abrimos trades nas datas permitidas
+    # Precisamos do índice original para achar a data de saída correta
+    indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
+    
+    if not indices_possiveis:
+        return None, "Intervalo inválido."
+
+    ultimo_idx_valido = len(data) - dias_hold
+    
+    # Pulo (Step) = dias_hold para não sobrepor operações (simplificação)
+    # Se quiser trades diários, mudar step para 1 (mas gera sobreposição complexa)
+    current_idx = indices_possiveis[0]
+    
+    while current_idx < ultimo_idx_valido:
+        # Verifica se a data atual ainda está dentro do limite final do usuário
+        if data.index[current_idx].date() > params['fim']:
+            break
+            
+        try:
+            # Entrada
+            entry_date = data.index[current_idx]
+            entry_price = float(data[col_preco].iloc[current_idx])
+            
+            # Saída
+            exit_idx = current_idx + dias_hold
+            exit_date = data.index[exit_idx]
+            exit_price = float(data[col_preco].iloc[exit_idx])
+            
+            # Strikes
+            strike_call = entry_price * (1 + dist_strike_pct)
+            strike_put = entry_price * (1 - dist_strike_pct)
+            
+            # Payoff Unitário
+            exercicio_call = exit_price > strike_call
+            exercicio_put = exit_price < strike_put
+            
+            payoff_call_unit = max(0, exit_price - strike_call)
+            payoff_put_unit = max(0, strike_put - exit_price)
+            
+            # Financeiro Total (Lote)
+            premio_total = (entry_price * premio_pct) * qtde
+            custo_entrada = premio_total * taxa_entrada
+            
+            payoff_total = 0.0
+            custo_exercicio = 0.0
+            
+            # Lógica das Opções
+            usar_call = 'Call' in tipo or 'Straddle' in tipo
+            usar_put = 'Put' in tipo or 'Straddle' in tipo
+            
+            if usar_call:
+                payoff_total += payoff_call_unit * qtde
+                if exercicio_call:
+                    custo_exercicio += (strike_call * qtde) * taxa_exercicio
+            
+            if usar_put:
+                payoff_total += payoff_put_unit * qtde
+                if exercicio_put:
+                    custo_exercicio += (strike_put * qtde) * taxa_exercicio
+            
+            custos_totais = custo_entrada + custo_exercicio
+            
+            # Resultado Operacional
+            if posicao == 'Comprado (Titular)':
+                res_op = payoff_total - premio_total - custos_totais
+            else:
+                res_op = premio_total - payoff_total - custos_totais
+                
+            # IR (Compensação)
+            ir = 0.0
+            if res_op > 0:
+                lucro_real = max(0, res_op - prejuizo_acumulado)
+                abatimento = res_op - lucro_real
+                prejuizo_acumulado -= abatimento
+                ir = lucro_real * ir_aliquota
+            else:
+                prejuizo_acumulado += abs(res_op)
+                
+            liquido = res_op - ir
+            
+            trades.append({
+                'Entrada': entry_date,
+                'Preço Ent.': entry_price,
+                'Saída': exit_date,
+                'Preço Sai.': exit_price,
+                'Prêmio': premio_total,
+                'Custos': custos_totais,
+                'Res. Oper.': res_op,
+                'IR': ir,
+                'Líquido': liquido
+            })
+            
+        except Exception:
+            pass
+        
+        # Avança para o próximo trade
+        current_idx += dias_hold
+        
+    return pd.DataFrame(trades), None
+
+# --- INTERFACE ---
+
+st.sidebar.header("⚙️ Parâmetros")
+
+# 1. Ativo e Lote
+ticker = st.sidebar.text_input("Ticker (com .SA)", "PETR4.SA").upper().strip()
+qtde = st.sidebar.number_input("Tamanho do Lote", min_value=100, value=1000, step=100)
+
+# 2. Configuração
+st.sidebar.markdown("---")
+posicao = st.sidebar.selectbox("Sua Posição", ['Comprado (Titular)', 'Vendido (Lançador)'])
+tipo = st.sidebar.selectbox("Estratégia", ['Call + Put (Straddle)', 'Apenas Call', 'Apenas Put'])
+
+# 3. Datas
+st.sidebar.markdown("---")
+col_dt1, col_dt2 = st.sidebar.columns(2)
+dt_hoje = date.today()
+inicio = col_dt1.date_input("Início", dt_hoje - timedelta(days=365))
+fim = col_dt2.date_input("Fim", dt_hoje)
+
+# 4. Parâmetros Opção
+st.sidebar.markdown("---")
+dias_hold = st.sidebar.slider("Dias Úteis (Vencimento)", 5, 120, 20, help="Duração da operação em pregões.")
+premio_pct = st.sidebar.slider("Prêmio Opção (% do Ativo)", 0.1, 15.0, 4.0, step=0.1)
+dist_strike = st.sidebar.slider("Distância Strike (%)", 0.0, 20.0, 0.0, step=0.5)
+
+# Botão de Execução
+if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
+    
+    if inicio >= fim:
+        st.error("Data de início deve ser anterior ao fim.")
+    else:
+        with st.spinner(f"Baixando dados de {ticker}..."):
+            df_dados = baixar_dados(ticker, inicio, fim)
+            
+        if df_dados.empty:
+            st.error("Não foi possível baixar dados para este ativo.")
+        else:
+            params = {
+                'ticker': ticker, 'qtde': qtde, 'posicao': posicao,
+                'tipo': tipo, 'inicio': inicio, 'fim': fim,
+                'dias_hold': dias_hold, 'premio_pct': premio_pct,
+                'dist_strike': dist_strike
+            }
+            
+            df_result, erro = calcular_estrategia(df_dados, params)
+            
+            if erro:
+                st.warning(erro)
+            elif df_result.empty:
+                st.warning("Nenhuma operação concluída no período (verifique as datas).")
+            else:
+                # --- DASHBOARD DE RESULTADOS ---
+                st.subheader(f"Resultado: {ticker} ({qtde} un.)")
+                st.markdown(f"**Estratégia:** {posicao} em {tipo} | **Custo:** {premio_pct}% | **Prazo:** {dias_hold} dias")
+                
+                total_liq = df_result['Líquido'].sum()
+                total_custos = df_result['Custos'].sum()
+                total_ir = df_result['IR'].sum()
+                acertos = len(df_result[df_result['Res. Oper.'] > 0])
+                win_rate = (acertos / len(df_result)) * 100
+                
+                # HTML Cards
+                cor_saldo = "positive" if total_liq > 0 else "negative"
+                
+                html_code = f"""
+                <div style="display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap;">
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">Resultado Líquido</div>
+                        <div class="metric-value {cor_saldo}">R$ {total_liq:,.2f}</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">Custos B3/Corretagem</div>
+                        <div class="metric-value warning">R$ {total_custos:,.2f}</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">IR Pago (15%)</div>
+                        <div class="metric-value negative">R$ {total_ir:,.2f}</div>
+                    </div>
+                    <div class="metric-card" style="flex: 1; min-width: 150px;">
+                        <div class="metric-label">Taxa de Acerto</div>
+                        <div class="metric-value neutral">{win_rate:.1f}%</div>
+                    </div>
+                </div>
+                """
+                st.markdown(html_code, unsafe_allow_html=True)
+                
+                # --- TABELA DETALHADA ---
+                st.markdown("### 📋 Extrato Financeiro")
+                
+                # Formatação para exibição
+                df_show = df_result.copy()
+                df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%Y')
+                df_show['Saída'] = df_show['Saída'].dt.strftime('%d/%m/%Y')
+                
+                # Colunas numéricas para formatação
+                cols_num = ['Preço Ent.', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'IR', 'Líquido']
+                
+                # Configuração da Tabela no Streamlit
+                st.dataframe(
+                    df_show.style.format({c: 'R$ {:.2f}' for c in cols_num})
+                           .map(lambda x: 'color: green;' if x > 0 else 'color: red;', subset=['Res. Oper.', 'Líquido']),
+                    use_container_width=True,
+                    height=500
+                )
+                
+                # Botão de Download CSV
+                csv = df_result.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Baixar Resultados em CSV",
+                    data=csv,
+                    file_name=f'backtest_{ticker}_{date.today()}.csv',
+                    mime='text/csv',
+                )
+
+else:
+    st.info("👈 Configure os parâmetros na barra lateral e clique em 'Rodar Simulação'.")
