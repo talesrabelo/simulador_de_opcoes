@@ -6,8 +6,8 @@ import warnings
 
 # --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(
-    page_title="Simulador de Opções Pro",
-    page_icon="📈",
+    page_title="Simulador de Opções (Builder)",
+    page_icon="🔧",
     layout="wide"
 )
 
@@ -50,7 +50,6 @@ def baixar_dados(ticker, inicio, fim):
         
         if df.empty: return pd.DataFrame()
         
-        # Limpeza MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df.columns = df.columns.get_level_values('Price')
@@ -64,31 +63,61 @@ def baixar_dados(ticker, inicio, fim):
     except:
         return pd.DataFrame()
 
-def calcular_resultado(data, params):
+def calcular_leg(pr_ent, pr_sai, qtde, tipo, posicao, offset_pct, premio_pct):
+    """Calcula o resultado financeiro de uma única perna"""
+    
+    # 1. Definição do Strike
+    strike = pr_ent * (1 + offset_pct/100.0)
+    
+    # 2. Custo Inicial (Prêmio)
+    premio_un = pr_ent * (premio_pct/100.0)
+    fin_premio = premio_un * qtde
+    
+    # 3. Payoff (Valor no Vencimento)
+    payoff_un = 0.0
+    exercido = False
+    
+    if tipo == 'Call':
+        payoff_un = max(0, pr_sai - strike)
+        if pr_sai > strike: exercido = True
+    elif tipo == 'Put':
+        payoff_un = max(0, strike - pr_sai)
+        if pr_sai < strike: exercido = True
+        
+    fin_payoff = payoff_un * qtde
+    
+    # 4. Custos Operacionais (B3 + Corretagem Estimada)
+    taxa_entrada = 0.005 # 0.5% sobre prêmio
+    taxa_exercicio = 0.005 # 0.5% sobre strike (pesado!)
+    
+    custo_ent = fin_premio * taxa_entrada
+    custo_sai = (strike * qtde * taxa_exercicio) if exercido else 0.0
+    custos_totais = custo_ent + custo_sai
+    
+    # 5. Resultado da Perna
+    resultado = 0.0
+    
+    if posicao == 'Comprado':
+        # Sai Prêmio, Entra Payoff
+        resultado = fin_payoff - fin_premio - custos_totais
+    else: # Vendido
+        # Entra Prêmio, Sai Payoff
+        resultado = fin_premio - fin_payoff - custos_totais
+        
+    return resultado, fin_premio, custos_totais, strike
+
+def calcular_estrategia_multipla(data, params):
     ticker = params['ticker']
     qtde = params['qtde']
-    posicao = params['posicao']
-    tipo = params['tipo']
     dias = params['dias']
-    premio_pct = params['premio_pct'] / 100.0
-    offset_pct = params['offset_pct'] / 100.0
+    legs = params['legs'] # Lista de dicionários com config das pernas
     
-    # Custos B3
-    taxa_entrada = 0.005
-    taxa_exercicio = 0.005
     ir_aliquota = 0.15
-    
-    # Validação Coluna
     col = 'Close' if 'Close' in data.columns else 'Adj Close'
-    if col not in data.columns: return None, "Preço não encontrado"
-
-    # Filtro Datas
-    mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
-    df_sim = data.loc[mask]
-    if df_sim.empty: return None, "Sem dados no período"
     
-    # Índices Válidos
+    mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
     indices = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
+    
     if not indices: return None, "Intervalo inválido"
     
     trades = []
@@ -100,137 +129,133 @@ def calcular_resultado(data, params):
         if data.index[curr].date() > params['fim']: break
         
         try:
-            # Dados Mercado
             dt_ent = data.index[curr]
             pr_ent = float(data[col].iloc[curr])
-            
             dt_sai = data.index[curr + dias]
             pr_sai = float(data[col].iloc[curr + dias])
             
-            # Definição Strikes
-            strike_call = 0.0
-            strike_put = 0.0
+            res_total = 0.0
+            custos_total = 0.0
+            premio_net = 0.0 # Positivo = Recebeu, Negativo = Pagou
             
-            if tipo == 'Straddle':
-                # Simétrico
-                strike_call = pr_ent * (1 + abs(offset_pct))
-                strike_put = pr_ent * (1 - abs(offset_pct))
-            else:
-                # Direcional (Respeita o sinal negativo/positivo)
-                strike_unico = pr_ent * (1 + offset_pct)
-                if tipo == 'Call': strike_call = strike_unico
-                if tipo == 'Put': strike_put = strike_unico
+            str_strikes = []
+            
+            # Itera sobre as pernas ativas
+            for leg in legs:
+                r, p_val, c, k = calcular_leg(
+                    pr_ent, pr_sai, qtde, 
+                    leg['tipo'], leg['posicao'], leg['offset'], leg['premio']
+                )
                 
-            # Pernas Ativas
-            usa_call = (tipo == 'Call' or tipo == 'Straddle')
-            usa_put = (tipo == 'Put' or tipo == 'Straddle')
-            
-            # 1. Custo Inicial (Prêmio Pago ou Recebido)
-            fin_premio = 0.0
-            if usa_call: fin_premio += (pr_ent * premio_pct) * qtde
-            if usa_put: fin_premio += (pr_ent * premio_pct) * qtde
-            
-            custo_ent = fin_premio * taxa_entrada
-            
-            # 2. Payoff Final e Exercício
-            payoff_tot = 0.0
-            custo_exe = 0.0
-            
-            if usa_call:
-                val = max(0, pr_sai - strike_call)
-                payoff_tot += val * qtde
-                if pr_sai > strike_call:
-                    custo_exe += (strike_call * qtde) * taxa_exercicio
-            
-            if usa_put:
-                val = max(0, strike_put - pr_sai)
-                payoff_tot += val * qtde
-                if pr_sai < strike_put:
-                    custo_exe += (strike_put * qtde) * taxa_exercicio
-            
-            custos_tot = custo_ent + custo_exe
-            
-            # 3. Resultado
-            if posicao == 'Comprado':
-                res = payoff_tot - fin_premio - custos_tot
-            else:
-                res = fin_premio - payoff_tot - custos_tot
+                res_total += r
+                custos_total += c
+                str_strikes.append(f"{leg['tipo'][0]}{k:.2f}")
                 
-            # 4. IR
+                if leg['posicao'] == 'Vendido':
+                    premio_net += p_val
+                else:
+                    premio_net -= p_val
+            
+            # IR
             ir = 0.0
-            if res > 0:
-                base = max(0, res - prej_acumulado)
-                prej_acumulado -= (res - base)
+            if res_total > 0:
+                base = max(0, res_total - prej_acumulado)
+                prej_acumulado -= (res_total - base)
                 ir = base * ir_aliquota
             else:
-                prej_acumulado += abs(res)
+                prej_acumulado += abs(res_total)
                 
-            liq = res - ir
-            
-            # Strike para exibição
-            strike_show = strike_call if tipo == 'Call' else (strike_put if tipo == 'Put' else 0)
+            liq = res_total - ir
             
             trades.append({
-                'Entrada': dt_ent, 'Pr_Ent': pr_ent, 'Strike': strike_show,
+                'Entrada': dt_ent, 'Pr_Ent': pr_ent, 
                 'Saida': dt_sai, 'Pr_Sai': pr_sai,
-                'Premio': fin_premio, 'Custos': custos_tot,
-                'Res_Op': res, 'IR': ir, 'Liquido': liq
+                'Strikes': " / ".join(str_strikes),
+                'Fluxo Inicial': premio_net, # Quanto pagou ou recebeu na montagem
+                'Custos': custos_total,
+                'Res_Op': res_total, 'Liquido': liq
             })
             
-        except: pass
+        except Exception as e: pass
         curr += dias
         
     return pd.DataFrame(trades), None
 
 # --- INTERFACE ---
-st.sidebar.header("⚙️ Configuração")
+st.sidebar.header("🔧 Montador de Estratégia")
 
 ticker = st.sidebar.text_input("Ticker", "PETR4.SA").upper().strip()
-qtde = st.sidebar.number_input("Lote", 100, 100000, 1000, step=100)
+qtde = st.sidebar.number_input("Lote (Qtde)", 100, 100000, 1000, 100)
+dias = st.sidebar.slider("Dias Úteis (Vencimento)", 5, 60, 20)
 
 st.sidebar.markdown("---")
-tipo = st.sidebar.selectbox("Estratégia", ['Call', 'Put', 'Straddle'])
-posicao = st.sidebar.selectbox("Posição", ['Comprado', 'Vendido'])
 
-# DATA
+# --- PERNA 1 ---
+st.sidebar.markdown("### 🟢 Perna 1 (Principal)")
+c1_p1, c2_p1 = st.sidebar.columns(2)
+tipo_p1 = c1_p1.selectbox("Tipo P1", ['Call', 'Put'], key='t1')
+pos_p1 = c2_p1.selectbox("Ação P1", ['Comprado', 'Vendido'], key='p1')
+off_p1 = st.sidebar.slider("Strike P1 vs Preço (%)", -20.0, 20.0, 0.0, 0.5, key='o1')
+pre_p1 = st.sidebar.slider("Custo P1 (% do Ativo)", 0.1, 10.0, 3.0, 0.1, key='c1')
+
+# --- PERNA 2 ---
 st.sidebar.markdown("---")
-c1, c2 = st.sidebar.columns(2)
-ini = c1.date_input("Início", date.today() - timedelta(days=365))
-fim = c2.date_input("Fim", date.today())
+usar_p2 = st.sidebar.checkbox("Adicionar Perna 2 (Combinada)")
+tipo_p2, pos_p2, off_p2, pre_p2 = None, None, 0.0, 0.0
 
-# PARÂMETROS OPÇÃO
+if usar_p2:
+    st.sidebar.markdown("### 🔵 Perna 2 (Secundária)")
+    c1_p2, c2_p2 = st.sidebar.columns(2)
+    tipo_p2 = c1_p2.selectbox("Tipo P2", ['Call', 'Put'], key='t2')
+    pos_p2 = c2_p2.selectbox("Ação P2", ['Comprado', 'Vendido'], key='p2', index=1) # Padrão Vendido para facilitar Travas
+    off_p2 = st.sidebar.slider("Strike P2 vs Preço (%)", -20.0, 20.0, 5.0, 0.5, key='o2')
+    pre_p2 = st.sidebar.slider("Custo P2 (% do Ativo)", 0.1, 10.0, 1.5, 0.1, key='c2')
+
+# --- DATAS ---
 st.sidebar.markdown("---")
-st.sidebar.caption("Parâmetros da Opção")
+dt_ini = st.sidebar.date_input("Início", date.today() - timedelta(days=365))
+dt_fim = st.sidebar.date_input("Fim", date.today())
 
-# Reorganizei a ordem para o Strike aparecer antes do Prazo (fica mais visível)
-offset = st.sidebar.slider("Strike vs Preço Atual (%)", -20.0, 20.0, 0.0, 0.5, help="0% = ATM. Positivo = Acima. Negativo = Abaixo.")
-premio = st.sidebar.slider("Prêmio p/ Perna (%)", 0.1, 10.0, 3.0, 0.1)
-dias = st.sidebar.slider("Dias Vencimento", 5, 60, 20)
-
-if st.sidebar.button("🚀 Simular", type="primary"):
-    with st.spinner(f"Processando {ticker}..."):
-        df_dados = baixar_dados(ticker, ini, fim)
+# --- EXECUÇÃO ---
+if st.sidebar.button("🚀 Simular Combinação", type="primary"):
+    with st.spinner("Processando..."):
+        df_dados = baixar_dados(ticker, dt_ini, dt_fim)
         
     if df_dados.empty:
-        st.error("Erro ao baixar dados.")
+        st.error("Sem dados.")
     else:
+        # Monta lista de pernas
+        legs_config = [{
+            'tipo': tipo_p1, 'posicao': pos_p1, 
+            'offset': off_p1, 'premio': pre_p1
+        }]
+        
+        desc_estrat = f"{pos_p1} {tipo_p1} ({off_p1}%)"
+        
+        if usar_p2:
+            legs_config.append({
+                'tipo': tipo_p2, 'posicao': pos_p2, 
+                'offset': off_p2, 'premio': pre_p2
+            })
+            desc_estrat += f" + {pos_p2} {tipo_p2} ({off_p2}%)"
+            
         params = {
-            'ticker': ticker, 'qtde': qtde, 'posicao': posicao,
-            'tipo': tipo, 'inicio': ini, 'fim': fim,
-            'dias': dias, 'premio_pct': premio, 'offset_pct': offset
+            'ticker': ticker, 'qtde': qtde, 'dias': dias,
+            'inicio': dt_ini, 'fim': dt_fim, 'legs': legs_config
         }
         
-        df, erro = calcular_resultado(df_dados, params)
+        df, erro = calcular_estrategia_multipla(df_dados, params)
         
         if erro: st.warning(erro)
-        elif df.empty: st.warning("Nenhuma operação gerada.")
+        elif df.empty: st.warning("Nenhuma operação.")
         else:
-            # DASHBOARD
+            # Cards
             tot_liq = df['Liquido'].sum()
-            tot_cus = df['Custos'].sum()
+            tot_cust = df['Custos'].sum()
             win = (len(df[df['Res_Op'] > 0]) / len(df)) * 100
-            
             cor = "positive" if tot_liq > 0 else "negative"
+            
+            st.subheader(f"Resultado: {desc_estrat}")
             
             st.markdown(f"""
             <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
@@ -239,25 +264,21 @@ if st.sidebar.button("🚀 Simular", type="primary"):
                     <div class="metric-value {cor}">R$ {tot_liq:,.2f}</div>
                 </div>
                 <div class="metric-card" style="flex: 1;">
-                    <div class="metric-label">Custos Totais</div>
-                    <div class="metric-value warning">R$ {tot_cus:,.2f}</div>
+                    <div class="metric-label">Custos Operacionais</div>
+                    <div class="metric-value warning">R$ {tot_cust:,.2f}</div>
                 </div>
                  <div class="metric-card" style="flex: 1;">
-                    <div class="metric-label">Win Rate</div>
+                    <div class="metric-label">Taxa de Acerto</div>
                     <div class="metric-value">{win:.1f}%</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
             
-            # TABELA
-            cols = ['Entrada', 'Pr_Ent', 'Strike', 'Saida', 'Pr_Sai', 'Premio', 'Custos', 'Res_Op', 'Liquido']
+            # Tabela
+            cols = ['Entrada', 'Pr_Ent', 'Strikes', 'Saida', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']
+            fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']}
+            
             df_show = df[cols].copy()
-            
-            # Remove Strike visual se for Straddle
-            if tipo == 'Straddle': df_show.drop(columns=['Strike'], inplace=True)
-            
-            # Formatação
-            fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Strike', 'Pr_Sai', 'Premio', 'Custos', 'Res_Op', 'Liquido'] if c in df_show.columns}
             df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%y')
             df_show['Saida'] = df_show['Saida'].dt.strftime('%d/%m/%y')
             
