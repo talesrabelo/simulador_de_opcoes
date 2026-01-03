@@ -3,18 +3,17 @@ import yfinance as yf
 import pandas as pd
 from datetime import date, timedelta
 import warnings
-import plotly.graph_objects as go
 
 # --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(
-    page_title="Backtest Opções vs CDI",
-    page_icon="📈",
+    page_title="Opções vs Renda Fixa",
+    page_icon="💰",
     layout="wide"
 )
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# --- ESTILO CSS ---
+# --- ESTILO CSS (Visual Limpo) ---
 st.markdown("""
 <style>
     .metric-card {
@@ -32,13 +31,13 @@ st.markdown("""
         font-weight: 600;
     }
     .metric-value {
-        font-size: 24px;
+        font-size: 28px;
         font-weight: bold;
         margin-top: 5px;
     }
     .positive { color: #28a745; }
     .negative { color: #dc3545; }
-    .warning { color: #ffc107; }
+    .neutral { color: #6c757d; }
     .info { color: #17a2b8; }
 </style>
 """, unsafe_allow_html=True)
@@ -47,12 +46,13 @@ st.markdown("""
 
 @st.cache_data(ttl=86400)
 def pegar_cdi_bcb():
-    """Baixa histórico do CDI do Banco Central"""
+    """Baixa CDI diário do Banco Central"""
     try:
         url = 'http://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?formato=csv'
         df = pd.read_csv(url, sep=';')
         df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
         df['valor'] = df['valor'].str.replace(',', '.').astype(float)
+        # Fator diário = 1 + (taxa/100)
         df['fator'] = 1 + (df['valor'] / 100)
         df.set_index('data', inplace=True)
         return df[['fator']]
@@ -66,6 +66,7 @@ def baixar_dados(ticker, inicio, fim):
         df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)
         if df.empty: return pd.DataFrame()
         
+        # Limpeza MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df.columns = df.columns.get_level_values('Price')
@@ -94,101 +95,88 @@ def calcular_leg(pr_ent, pr_sai, qtde, tipo, posicao, offset_pct, premio_pct):
         if pr_sai < strike: exercido = True
         
     fin_payoff = payoff_un * qtde
+    
+    # Taxas: 0.5% entrada (premio) + 0.5% saida (strike se exercido)
     taxa_ent = fin_premio * 0.005
     taxa_sai = (strike * qtde * 0.005) if exercido else 0.0
     custos = taxa_ent + taxa_sai
     
     res = (fin_payoff - fin_premio - custos) if posicao == 'Comprado' else (fin_premio - fin_payoff - custos)
     
-    return res, fin_premio, custos, strike
+    return res, custos
 
 def simular_comparativo(data, params, df_cdi):
-    # 1. Executa Trades
+    capital_atual_estrat = params['capital'] # Começa com R$ X
+    
+    # Cria a curva do CDI (Universo B)
+    # Se df_cdi existir, filtramos pelo período e calculamos o acumulado
+    fator_acumulado_cdi = 1.0
+    if not df_cdi.empty:
+        # Pega CDI desde o início até o fim da simulação
+        mask_cdi = (df_cdi.index >= pd.to_datetime(params['inicio'])) & (df_cdi.index <= pd.to_datetime(params['fim']))
+        fator_acumulado_cdi = df_cdi.loc[mask_cdi, 'fator'].prod()
+    
+    capital_final_cdi = params['capital'] * fator_acumulado_cdi
+    
+    # Simula a Estratégia (Universo A)
     trades = []
     prej_acumulado = 0.0
     
-    dias = params['dias']
-    qtde = params['qtde']
     col = 'Close' if 'Close' in data.columns else 'Adj Close'
-    
     indices = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
-    if not indices: return None, pd.DataFrame(), "Intervalo inválido"
+    
+    if not indices: return None, "Intervalo inválido"
     
     curr = indices[0]
-    limit = len(data) - dias
+    limit = len(data) - params['dias']
     
     while curr < limit:
         if data.index[curr].date() > params['fim']: break
         try:
+            # Dados Trade
             dt_ent = data.index[curr]
-            dt_sai = data.index[curr + dias]
+            dt_sai = data.index[curr + params['dias']]
             pr_ent = float(data[col].iloc[curr])
-            pr_sai = float(data[col].iloc[curr + dias])
+            pr_sai = float(data[col].iloc[curr + params['dias']] )
             
-            res_op = 0.0
-            custos = 0.0
-            fluxo_ini = 0.0
-            strikes = []
+            res_bruto_trade = 0.0
+            custos_trade = 0.0
             
+            # Calcula Pernas
             for leg in params['legs']:
-                r, p_val, c, k = calcular_leg(pr_ent, pr_sai, qtde, leg['tipo'], leg['posicao'], leg['offset'], leg['premio'])
-                res_op += r
-                custos += c
-                strikes.append(f"{leg['tipo'][0]}{k:.2f}")
-                fluxo_ini += p_val if leg['posicao'] == 'Vendido' else -p_val
+                r, c = calcular_leg(pr_ent, pr_sai, params['qtde'], leg['tipo'], leg['posicao'], leg['offset'], leg['premio'])
+                res_bruto_trade += r
+                custos_trade += c
             
             # IR
             ir = 0.0
-            if res_op > 0:
-                base = max(0, res_op - prej_acumulado)
-                prej_acumulado -= (res_op - base)
+            if res_bruto_trade > 0:
+                base = max(0, res_bruto_trade - prej_acumulado)
+                prej_acumulado -= (res_bruto_trade - base)
                 ir = base * 0.15
             else:
-                prej_acumulado += abs(res_op)
+                prej_acumulado += abs(res_bruto_trade)
+            
+            liq_trade = res_bruto_trade - ir
+            
+            # Atualiza o Capital da Estratégia (Juros Simples sobre o saldo anterior ou apenas soma ao caixa)
+            # Modelo: O lucro entra no caixa, o prejuízo sai do caixa.
+            capital_atual_estrat += liq_trade
             
             trades.append({
-                'Data': dt_sai, # Data de realização do lucro
-                'Res_Liquido': res_op - ir
+                'Data Saída': dt_sai,
+                'Resultado Op.': liq_trade,
+                'Saldo Acumulado': capital_atual_estrat
             })
             
         except: pass
-        curr += dias
-        
-    df_trades = pd.DataFrame(trades)
-    if df_trades.empty: return None, pd.DataFrame(), "Nenhuma operação gerada"
+        curr += params['dias']
     
-    # 2. Curva de Patrimônio (Estratégia) vs CDI
-    # Cria range de datas completo
-    dt_range = pd.date_range(start=params['inicio'], end=params['fim'], freq='B') # Business days
-    df_compare = pd.DataFrame(index=dt_range)
-    
-    # Mapeia CDI
-    df_compare['Fator_CDI'] = 1.0
-    if not df_cdi.empty:
-        # Join com CDI do BC
-        df_temp = df_cdi.loc[df_cdi.index.isin(dt_range)]
-        df_compare.loc[df_temp.index, 'Fator_CDI'] = df_temp['fator']
-    
-    # Preenche vazios do CDI com 1.0
-    df_compare['Fator_CDI'].fillna(1.0, inplace=True)
-    
-    # Calcula Curva CDI (Juros Compostos)
-    capital = params['capital']
-    df_compare['Patrimonio_CDI'] = capital * df_compare['Fator_CDI'].cumprod()
-    
-    # Calcula Curva Estratégia (Soma Simples dos Resultados ao Capital)
-    # Agrupa trades por data de saída
-    df_sum_trades = df_trades.groupby('Data')['Res_Liquido'].sum()
-    
-    df_compare['Trade_Result'] = 0.0
-    # Mapeia resultados nas datas corretas (usando índice datetime)
-    comuns = df_compare.index.intersection(df_sum_trades.index)
-    df_compare.loc[comuns, 'Trade_Result'] = df_sum_trades.loc[comuns]
-    
-    # Acumula
-    df_compare['Patrimonio_Estrat'] = capital + df_compare['Trade_Result'].cumsum()
-    
-    return df_compare, df_trades, None
+    return {
+        'saldo_opcoes': capital_atual_estrat,
+        'saldo_cdi': capital_final_cdi,
+        'trades': pd.DataFrame(trades)
+    }, None
 
 # --- INTERFACE ---
 st.sidebar.header("🔧 Configuração")
@@ -196,15 +184,13 @@ st.sidebar.header("🔧 Configuração")
 with st.spinner("Carregando CDI..."):
     df_cdi = pegar_cdi_bcb()
 
-# Inputs Principais
+# Inputs
 ticker = st.sidebar.text_input("Ticker", "PETR4.SA").upper().strip()
-capital = st.sidebar.number_input("Capital Inicial (R$)", 1000.0, 1000000.0, 50000.0, 1000.0, help="Valor usado para o Benchmark do CDI")
+capital = st.sidebar.number_input("Capital Inicial (R$)", 1000.0, 1000000.0, 50000.0, 1000.0)
 qtde = st.sidebar.number_input("Lote Opções", 100, 100000, 1000, 100)
 dias = st.sidebar.slider("Vencimento (Dias)", 5, 60, 20)
 
 st.sidebar.markdown("---")
-
-# Pernas
 c1, c2 = st.sidebar.columns(2)
 t1 = c1.selectbox("Tipo P1", ['Call', 'Put'], key='t1')
 p1 = c2.selectbox("Ação P1", ['Comprado', 'Vendido'], key='p1')
@@ -225,8 +211,8 @@ st.sidebar.markdown("---")
 ini = st.sidebar.date_input("Início", date.today() - timedelta(days=365*2))
 fim = st.sidebar.date_input("Fim", date.today())
 
-if st.sidebar.button("🚀 Comparar com CDI", type="primary"):
-    with st.spinner("Processando..."):
+if st.sidebar.button("🚀 Comparar Resultados", type="primary"):
+    with st.spinner("Calculando..."):
         df_dados = baixar_dados(ticker, ini, fim)
         
     if df_dados.empty:
@@ -240,53 +226,54 @@ if st.sidebar.button("🚀 Comparar com CDI", type="primary"):
             'inicio': ini, 'fim': fim, 'legs': legs
         }
         
-        df_comp, df_ops, erro = simular_comparativo(df_dados, params, df_cdi)
+        res, erro = simular_comparativo(df_dados, params, df_cdi)
         
         if erro: st.warning(erro)
+        elif res['trades'].empty: st.warning("Nenhuma operação gerada.")
         else:
-            # Cálculos Finais
-            saldo_final_estrat = df_comp['Patrimonio_Estrat'].iloc[-1]
-            saldo_final_cdi = df_comp['Patrimonio_CDI'].iloc[-1]
-            lucro_estrat = saldo_final_estrat - capital
-            lucro_cdi = saldo_final_cdi - capital
+            # RESULTADOS FINAIS
+            s_op = res['saldo_opcoes']
+            s_cdi = res['saldo_cdi']
             
-            perf_estrat_pct = ((saldo_final_estrat / capital) - 1) * 100
-            perf_cdi_pct = ((saldo_final_cdi / capital) - 1) * 100
+            # Rentabilidade %
+            rent_op = ((s_op / capital) - 1) * 100
+            rent_cdi = ((s_cdi / capital) - 1) * 100
+            diff = s_op - s_cdi
             
-            cor_estrat = "positive" if lucro_estrat > 0 else "negative"
-            delta_vs_cdi = perf_estrat_pct - perf_cdi_pct
-            cor_delta = "positive" if delta_vs_cdi > 0 else "negative"
+            cor_op = "positive" if rent_op > 0 else "negative"
+            cor_diff = "positive" if diff > 0 else "negative"
             
-            st.subheader("🏆 Comparativo de Performance")
+            st.subheader(f"Comparativo Final: R$ {capital:,.2f} aplicados em {ini.strftime('%d/%m/%Y')}")
             
             st.markdown(f"""
-            <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
-                <div class="metric-card" style="flex: 1;">
-                    <div class="metric-label">Opções (Saldo Final)</div>
-                    <div class="metric-value {cor_estrat}">R$ {saldo_final_estrat:,.2f}</div>
-                    <div class="metric-sub">Retorno: {perf_estrat_pct:.1f}%</div>
+            <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 30px;">
+                <div class="metric-card" style="flex: 1; border-top: 5px solid blue;">
+                    <div class="metric-label">Saldo Opções</div>
+                    <div class="metric-value {cor_op}">R$ {s_op:,.2f}</div>
+                    <div class="metric-label" style="margin-top:10px;">Retorno: {rent_op:.1f}%</div>
                 </div>
-                <div class="metric-card" style="flex: 1;">
-                    <div class="metric-label">Benchmark CDI</div>
-                    <div class="metric-value info">R$ {saldo_final_cdi:,.2f}</div>
-                    <div class="metric-sub">Retorno: {perf_cdi_pct:.1f}%</div>
+                <div class="metric-card" style="flex: 1; border-top: 5px solid gray;">
+                    <div class="metric-label">Saldo 100% CDI</div>
+                    <div class="metric-value info">R$ {s_cdi:,.2f}</div>
+                    <div class="metric-label" style="margin-top:10px;">Retorno: {rent_cdi:.1f}%</div>
                 </div>
-                <div class="metric-card" style="flex: 1;">
-                    <div class="metric-label">Opções vs CDI</div>
-                    <div class="metric-value {cor_delta}">{delta_vs_cdi:+.1f}%</div>
-                    <div class="metric-sub">Diferencial de Alpha</div>
+                <div class="metric-card" style="flex: 1; border-top: 5px solid {('green' if diff > 0 else 'red')};">
+                    <div class="metric-label">Diferença (Bolso)</div>
+                    <div class="metric-value {cor_diff}">R$ {diff:+,.2f}</div>
+                    <div class="metric-label" style="margin-top:10px;">Opções vs CDI</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
             
-            # Gráfico Comparativo
-            st.markdown("### 📈 Evolução Patrimonial")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_comp.index, y=df_comp['Patrimonio_Estrat'], name='Estratégia Opções', line=dict(color='blue', width=2)))
-            fig.add_trace(go.Scatter(x=df_comp.index, y=df_comp['Patrimonio_CDI'], name='Benchmark CDI', line=dict(color='gray', dash='dot')))
-            fig.update_layout(title="Comparação: Capital Aplicado na Estratégia vs. CDI", xaxis_title="Data", yaxis_title="Patrimônio (R$)", height=500, hovermode="x unified")
-            st.plotly_chart(fig, use_container_width=True)
+            st.markdown("### 📋 Evolução da Conta Opções")
+            df_show = res['trades'].copy()
+            df_show['Data Saída'] = pd.to_datetime(df_show['Data Saída']).dt.strftime('%d/%m/%Y')
             
-            # Tabela de Trades (Opcional, escondido em expander para limpar a tela)
-            with st.expander("Ver Lista de Operações Individuais"):
-                st.dataframe(df_ops)
+            st.dataframe(
+                df_show.style.format({
+                    'Resultado Op.': 'R$ {:.2f}',
+                    'Saldo Acumulado': 'R$ {:.2f}'
+                }).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Resultado Op.']),
+                use_container_width=True,
+                height=500
+            )
