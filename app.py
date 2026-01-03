@@ -6,15 +6,15 @@ import warnings
 
 # Configuração da Página
 st.set_page_config(
-    page_title="Simulador de Opções B3",
-    page_icon="💰",
+    page_title="Simulador de Opções B3 (Pro)",
+    page_icon="📊",
     layout="wide"
 )
 
 # Ignorar avisos de versão
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# --- CSS CUSTOMIZADO PARA OS CARDS ---
+# --- CSS CUSTOMIZADO ---
 st.markdown("""
 <style>
     .metric-card {
@@ -43,16 +43,13 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- FUNÇÕES DE DADOS (COM CACHE) ---
+# --- CACHE DE DADOS ---
 @st.cache_data(ttl=3600)
 def baixar_dados(ticker, inicio, fim):
-    """Baixa dados do Yahoo Finance com cache para performance."""
     try:
-        # Adiciona margem de segurança para garantir fechamento dos candles futuros
         fim_ajustado = fim + timedelta(days=200)
         df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)
         
-        # Limpeza de MultiIndex (Correção Yahoo)
         if df.empty: return df
         if isinstance(df.columns, pd.MultiIndex):
             try:
@@ -60,61 +57,54 @@ def baixar_dados(ticker, inicio, fim):
             except:
                 df.columns = df.columns.get_level_values(0)
         
-        # Remove timezone
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
             
         return df
     except Exception as e:
-        st.error(f"Erro ao baixar dados: {e}")
         return pd.DataFrame()
 
-# --- MOTOR DE CÁLCULO ---
+# --- MOTOR DE CÁLCULO FINANCEIRO ---
 def calcular_estrategia(data, params):
     ticker = params['ticker']
     qtde = params['qtde']
-    posicao = params['posicao']
-    tipo = params['tipo']
-    premio_pct_perna = params['premio_pct'] / 100.0  # Custo POR PERNA
-    dist_strike_pct = params['dist_strike'] / 100.0
+    posicao = params['posicao'] # 'Comprado' ou 'Vendido'
+    tipo = params['tipo']       # 'Call', 'Put', 'Straddle'
+    premio_pct_perna = params['premio_pct'] / 100.0
+    strike_offset_pct = params['strike_offset'] / 100.0
     dias_hold = params['dias_hold']
     
-    # Taxas B3 / Corretagem
+    # Parâmetros de Custo B3
     taxa_entrada = 0.005  # 0.5% sobre o prêmio
-    taxa_exercicio = 0.005 # 0.5% sobre o strike (notional)
+    taxa_exercicio = 0.005 # 0.5% sobre o strike
     ir_aliquota = 0.15
     
     col_preco = 'Close'
     if 'Close' not in data.columns:
         col_preco = 'Adj Close' if 'Adj Close' in data.columns else None
-        
-    if not col_preco:
-        return None, "Coluna de preço não encontrada."
+    
+    if not col_preco: return None, "Coluna de preço não encontrada."
 
-    # Filtra período
+    # Filtra Período
     mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
     data_sim = data.loc[mask]
     
-    if len(data_sim) == 0:
-        return None, "Sem dados no período selecionado."
+    if len(data_sim) == 0: return None, "Sem dados no período."
+
+    indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
+    
+    if not indices_possiveis: return None, "Intervalo inválido."
 
     trades = []
     prejuizo_acumulado = 0.0
-    
-    indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
-    
-    if not indices_possiveis:
-        return None, "Intervalo inválido."
-
     ultimo_idx_valido = len(data) - dias_hold
     current_idx = indices_possiveis[0]
     
     while current_idx < ultimo_idx_valido:
-        if data.index[current_idx].date() > params['fim']:
-            break
+        if data.index[current_idx].date() > params['fim']: break
             
         try:
-            # Dados de Mercado
+            # 1. Dados de Mercado (Entrada/Saída)
             entry_date = data.index[current_idx]
             entry_price = float(data[col_preco].iloc[current_idx])
             
@@ -122,57 +112,63 @@ def calcular_estrategia(data, params):
             exit_date = data.index[exit_idx]
             exit_price = float(data[col_preco].iloc[exit_idx])
             
-            # Definição dos Strikes
-            strike_call = entry_price * (1 + dist_strike_pct)
-            strike_put = entry_price * (1 - dist_strike_pct)
+            # 2. Definição Inteligente de Strikes
+            strike_call = 0.0
+            strike_put = 0.0
             
-            # Definição de Quais Pernas Usar
-            usar_call = 'Call' in tipo or 'Straddle' in tipo
-            usar_put = 'Put' in tipo or 'Straddle' in tipo
+            # Lógica:
+            # Se for Straddle/Combo, mantém simetria (Ex: Offset 5% -> Call +5%, Put -5%)
+            # Se for Perna Única, respeita o sinal (Ex: Call -5% -> Call ITM; Put -5% -> Put OTM)
             
-            # --- CÁLCULO DE CUSTOS (CORRIGIDO) ---
+            if tipo == 'Straddle (Call + Put)':
+                offset_abs = abs(strike_offset_pct)
+                strike_call = entry_price * (1 + offset_abs)
+                strike_put = entry_price * (1 - offset_abs)
+            else:
+                # Perna única: usa o valor exato do slider (pode ser negativo ou positivo)
+                strike_unico = entry_price * (1 + strike_offset_pct)
+                if tipo == 'Call': strike_call = strike_unico
+                if tipo == 'Put': strike_put = strike_unico
+
+            # 3. Definição de Pernas Ativas
+            usar_call = (tipo == 'Call' or tipo == 'Straddle (Call + Put)')
+            usar_put = (tipo == 'Put' or tipo == 'Straddle (Call + Put)')
+            
+            # 4. Cálculo Financeiro
             financeiro_premio_total = 0.0
             
-            # Custo Call (se ativa)
-            if usar_call:
-                custo_call = (entry_price * premio_pct_perna) * qtde
-                financeiro_premio_total += custo_call
+            if usar_call: financeiro_premio_total += (entry_price * premio_pct_perna) * qtde
+            if usar_put:  financeiro_premio_total += (entry_price * premio_pct_perna) * qtde
             
-            # Custo Put (se ativa)
-            if usar_put:
-                custo_put = (entry_price * premio_pct_perna) * qtde
-                financeiro_premio_total += custo_put
-            
-            # Taxa de Entrada (incide sobre o prêmio total pago/recebido)
             custo_entrada = financeiro_premio_total * taxa_entrada
             
-            # --- CÁLCULO DE PAYOFF E EXERCÍCIO ---
+            # 5. Payoff e Exercício
             payoff_total = 0.0
             custo_exercicio = 0.0
             
             if usar_call:
-                payoff_call_unit = max(0, exit_price - strike_call)
-                payoff_total += payoff_call_unit * qtde
-                if exit_price > strike_call: # Exercício
+                payoff = max(0, exit_price - strike_call)
+                payoff_total += payoff * qtde
+                if exit_price > strike_call: # Exerceu Call
                     custo_exercicio += (strike_call * qtde) * taxa_exercicio
             
             if usar_put:
-                payoff_put_unit = max(0, strike_put - exit_price)
-                payoff_total += payoff_put_unit * qtde
-                if exit_price < strike_put: # Exercício
+                payoff = max(0, strike_put - exit_price)
+                payoff_total += payoff * qtde
+                if exit_price < strike_put: # Exerceu Put
                     custo_exercicio += (strike_put * qtde) * taxa_exercicio
             
             custos_totais = custo_entrada + custo_exercicio
             
-            # --- RESULTADO OPERACIONAL ---
+            # 6. Resultado Final
             if posicao == 'Comprado (Titular)':
-                # Lucro = O que recebeu no final (Payoff) - O que pagou no início (Prêmio) - Custos
+                # Ganha Payoff, Paga Prêmio + Taxas
                 res_op = payoff_total - financeiro_premio_total - custos_totais
-            else: # Vendido
-                # Lucro = O que recebeu no início (Prêmio) - O que pagou no final (Payoff) - Custos
+            else: # Vendido (Lançador)
+                # Ganha Prêmio, Paga Payoff + Taxas
                 res_op = financeiro_premio_total - payoff_total - custos_totais
-                
-            # IR (Compensação de Prejuízo)
+            
+            # 7. IR
             ir = 0.0
             if res_op > 0:
                 lucro_real = max(0, res_op - prejuizo_acumulado)
@@ -181,12 +177,19 @@ def calcular_estrategia(data, params):
                 ir = lucro_real * ir_aliquota
             else:
                 prejuizo_acumulado += abs(res_op)
-                
+            
             liquido = res_op - ir
             
+            # Determina qual strike exibir na tabela
+            strike_display = 0.0
+            if tipo == 'Call': strike_display = strike_call
+            elif tipo == 'Put': strike_display = strike_put
+            else: strike_display = 0.0 # Straddle mostra 0 ou tratamos visualmente depois
+
             trades.append({
                 'Entrada': entry_date,
                 'Preço Ent.': entry_price,
+                'Strike': strike_display, # Coluna Nova
                 'Saída': exit_date,
                 'Preço Sai.': exit_price,
                 'Prêmio': financeiro_premio_total,
@@ -196,8 +199,7 @@ def calcular_estrategia(data, params):
                 'Líquido': liquido
             })
             
-        except Exception:
-            pass
+        except Exception: pass
         
         current_idx += dias_hold
         
@@ -205,118 +207,118 @@ def calcular_estrategia(data, params):
 
 # --- INTERFACE ---
 
-st.sidebar.header("⚙️ Parâmetros")
+st.sidebar.header("⚙️ Configuração")
 
-# 1. Ativo e Lote
-ticker = st.sidebar.text_input("Ticker (com .SA)", "PETR4.SA").upper().strip()
-qtde = st.sidebar.number_input("Tamanho do Lote", min_value=100, value=1000, step=100)
+# 1. Inputs Básicos
+ticker = st.sidebar.text_input("Ticker", "PETR4.SA").upper().strip()
+qtde = st.sidebar.number_input("Lote (Qtde)", min_value=100, value=1000, step=100)
 
-# 2. Configuração
+# 2. Estratégia
 st.sidebar.markdown("---")
+tipo = st.sidebar.selectbox("Tipo de Opção", ['Call', 'Put', 'Straddle (Call + Put)'])
 posicao = st.sidebar.selectbox("Sua Posição", ['Comprado (Titular)', 'Vendido (Lançador)'])
-tipo = st.sidebar.selectbox("Estratégia", ['Call + Put (Straddle)', 'Apenas Call', 'Apenas Put'])
 
-# 3. Datas
+# 3. Janela Temporal
 st.sidebar.markdown("---")
-col_dt1, col_dt2 = st.sidebar.columns(2)
-dt_hoje = date.today()
-inicio = col_dt1.date_input("Início", dt_hoje - timedelta(days=365))
-fim = col_dt2.date_input("Fim", dt_hoje)
+c1, c2 = st.sidebar.columns(2)
+inicio = c1.date_input("Início", date.today() - timedelta(days=365))
+fim = c2.date_input("Fim", date.today())
 
-# 4. Parâmetros Opção
+# 4. Parâmetros Avançados
 st.sidebar.markdown("---")
-dias_hold = st.sidebar.slider("Dias Úteis (Vencimento)", 5, 120, 20, help="Duração da operação em pregões.")
+st.sidebar.markdown("**Parâmetros da Opção**")
 
-# AJUSTE NA DESCRIÇÃO DO SLIDER
-premio_pct = st.sidebar.slider("Prêmio POR PERNA (% do Ativo)", 0.1, 15.0, 3.0, step=0.1, help="Custo unitário da Call e da Put. No Straddle, esse valor será duplicado.")
-dist_strike = st.sidebar.slider("Distância Strike (%)", 0.0, 20.0, 0.0, step=0.5)
+dias_hold = st.sidebar.slider("Dias até Vencimento", 5, 90, 20)
+premio_pct = st.sidebar.slider("Prêmio p/ Perna (% do Ativo)", 0.1, 15.0, 3.0, step=0.1, help="Quanto custa cada opção em % do preço da ação hoje.")
 
-# Botão de Execução
-if st.sidebar.button("🚀 Rodar Simulação", type="primary"):
-    
+# SLIDER IMPORTANTE: Strike Relativo
+strike_offset = st.sidebar.slider(
+    "Strike vs Preço Atual (%)", 
+    -30.0, 30.0, 0.0, step=0.5,
+    help="Negativo = Strike Abaixo do Preço. Positivo = Strike Acima do Preço. (No Straddle, define o intervalo)."
+)
+
+# Botão
+if st.sidebar.button("🚀 Simular Estratégia", type="primary"):
     if inicio >= fim:
-        st.error("Data de início deve ser anterior ao fim.")
+        st.error("Data final deve ser maior que inicial.")
     else:
-        with st.spinner(f"Baixando dados de {ticker}..."):
+        with st.spinner(f"Processando {ticker}..."):
             df_dados = baixar_dados(ticker, inicio, fim)
             
         if df_dados.empty:
-            st.error("Não foi possível baixar dados para este ativo.")
+            st.error("Dados não encontrados.")
         else:
             params = {
-                'ticker': ticker, 'qtde': qtde, 'posicao': posicao,
-                'tipo': tipo, 'inicio': inicio, 'fim': fim,
-                'dias_hold': dias_hold, 'premio_pct': premio_pct,
-                'dist_strike': dist_strike
+                'ticker': ticker, 'qtde': qtde, 'posicao': posicao, 'tipo': tipo,
+                'inicio': inicio, 'fim': fim, 'dias_hold': dias_hold,
+                'premio_pct': premio_pct, 'strike_offset': strike_offset
             }
             
-            df_result, erro = calcular_estrategia(df_dados, params)
+            df_res, erro = calcular_estrategia(df_dados, params)
             
-            if erro:
-                st.warning(erro)
-            elif df_result.empty:
-                st.warning("Nenhuma operação concluída no período (verifique as datas).")
+            if erro: st.warning(erro)
+            elif df_res.empty: st.warning("Nenhuma operação gerada.")
             else:
-                # --- DASHBOARD DE RESULTADOS ---
-                st.subheader(f"Resultado: {ticker} ({qtde} un.)")
+                # --- RESULTADOS ---
+                custo_txt = f"{premio_pct}%" if tipo != 'Straddle (Call + Put)' else f"{premio_pct*2:.1f}% (Total)"
+                st.subheader(f"Resultado: {ticker} | {tipo} ({posicao})")
+                st.caption(f"Strike Offset: {strike_offset}% | Custo: {custo_txt} | Prazo: {dias_hold} dias")
                 
-                # Exibe custo total estimado na legenda
-                custo_total_legenda = premio_pct * 2 if 'Straddle' in tipo else premio_pct
-                st.markdown(f"**Estratégia:** {posicao} em {tipo} | **Custo Total Estimado:** {custo_total_legenda:.1f}% ({premio_pct}% por perna) | **Prazo:** {dias_hold} dias")
+                tot_liq = df_res['Líquido'].sum()
+                tot_custos = df_res['Custos'].sum()
+                tot_ir = df_res['IR'].sum()
+                win_rate = (len(df_res[df_res['Res. Oper.'] > 0]) / len(df_res)) * 100
                 
-                total_liq = df_result['Líquido'].sum()
-                total_custos = df_result['Custos'].sum()
-                total_ir = df_result['IR'].sum()
-                acertos = len(df_result[df_result['Res. Oper.'] > 0])
-                win_rate = (acertos / len(df_result)) * 100
+                cor = "positive" if tot_liq > 0 else "negative"
                 
-                cor_saldo = "positive" if total_liq > 0 else "negative"
-                
-                html_code = f"""
-                <div style="display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap;">
-                    <div class="metric-card" style="flex: 1; min-width: 150px;">
-                        <div class="metric-label">Resultado Líquido</div>
-                        <div class="metric-value {cor_saldo}">R$ {total_liq:,.2f}</div>
+                # Cards
+                st.markdown(f"""
+                <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px;">
+                    <div class="metric-card" style="flex: 1;">
+                        <div class="metric-label">Líquido Final</div>
+                        <div class="metric-value {cor}">R$ {tot_liq:,.2f}</div>
                     </div>
-                    <div class="metric-card" style="flex: 1; min-width: 150px;">
-                        <div class="metric-label">Custos B3/Corretagem</div>
-                        <div class="metric-value warning">R$ {total_custos:,.2f}</div>
+                    <div class="metric-card" style="flex: 1;">
+                        <div class="metric-label">Custos Totais</div>
+                        <div class="metric-value warning">R$ {tot_custos:,.2f}</div>
                     </div>
-                    <div class="metric-card" style="flex: 1; min-width: 150px;">
-                        <div class="metric-label">IR Pago (15%)</div>
-                        <div class="metric-value negative">R$ {total_ir:,.2f}</div>
+                    <div class="metric-card" style="flex: 1;">
+                        <div class="metric-label">IR (15%)</div>
+                        <div class="metric-value negative">R$ {tot_ir:,.2f}</div>
                     </div>
-                    <div class="metric-card" style="flex: 1; min-width: 150px;">
-                        <div class="metric-label">Taxa de Acerto</div>
+                    <div class="metric-card" style="flex: 1;">
+                        <div class="metric-label">Win Rate</div>
                         <div class="metric-value neutral">{win_rate:.1f}%</div>
                     </div>
                 </div>
-                """
-                st.markdown(html_code, unsafe_allow_html=True)
+                """, unsafe_allow_html=True)
                 
-                # --- TABELA DETALHADA ---
-                st.markdown("### 📋 Extrato Financeiro")
+                # Tabela
+                st.markdown("### 📋 Detalhamento")
                 
-                df_show = df_result.copy()
+                cols = ['Entrada', 'Preço Ent.', 'Strike', 'Saída', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'Líquido']
+                df_show = df_res[cols].copy()
+                
+                # Se for Straddle, a coluna Strike fica confusa (são 2 strikes), então zeramos visualmente ou removemos
+                if tipo == 'Straddle (Call + Put)':
+                    df_show.drop(columns=['Strike'], inplace=True)
+                
+                # Formatação datas
                 df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%Y')
                 df_show['Saída'] = df_show['Saída'].dt.strftime('%d/%m/%Y')
                 
-                cols_num = ['Preço Ent.', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'IR', 'Líquido']
+                # Formatação Moeda
+                f_moeda = lambda x: f"R$ {x:,.2f}"
+                cols_moeda = [c for c in df_show.columns if c not in ['Entrada', 'Saída']]
                 
                 st.dataframe(
-                    df_show.style.format({c: 'R$ {:.2f}' for c in cols_num})
-                           .map(lambda x: 'color: green;' if x > 0 else 'color: red;', subset=['Res. Oper.', 'Líquido']),
+                    df_show.style.format({c: f_moeda for c in cols_moeda})
+                           .map(lambda x: 'color: green' if x > 0 else 'color: red', subset=['Res. Oper.', 'Líquido']),
                     use_container_width=True,
                     height=500
                 )
                 
-                csv = df_result.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Baixar Resultados em CSV",
-                    data=csv,
-                    file_name=f'backtest_{ticker}_{date.today()}.csv',
-                    mime='text/csv',
-                )
-
-else:
-    st.info("👈 Configure os parâmetros na barra lateral e clique em 'Rodar Simulação'.")
+                # Download
+                csv = df_res.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download CSV", csv, "backtest_opcoes.csv", "text/csv")
