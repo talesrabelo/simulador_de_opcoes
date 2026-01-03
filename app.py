@@ -4,17 +4,16 @@ import pandas as pd
 from datetime import date, timedelta
 import warnings
 
-# Configuração da Página
+# --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(
-    page_title="Simulador de Opções B3 (Pro)",
-    page_icon="📊",
+    page_title="Simulador de Opções Pro",
+    page_icon="📈",
     layout="wide"
 )
 
-# Ignorar avisos de versão
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# --- CSS CUSTOMIZADO ---
+# --- ESTILO CSS ---
 st.markdown("""
 <style>
     .metric-card {
@@ -38,19 +37,20 @@ st.markdown("""
     }
     .positive { color: #28a745; }
     .negative { color: #dc3545; }
-    .neutral { color: #6c757d; }
     .warning { color: #ffc107; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- CACHE DE DADOS ---
+# --- FUNÇÕES ---
 @st.cache_data(ttl=3600)
 def baixar_dados(ticker, inicio, fim):
     try:
         fim_ajustado = fim + timedelta(days=200)
         df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)
         
-        if df.empty: return df
+        if df.empty: return pd.DataFrame()
+        
+        # Limpeza MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df.columns = df.columns.get_level_values('Price')
@@ -61,264 +61,208 @@ def baixar_dados(ticker, inicio, fim):
             df.index = df.index.tz_localize(None)
             
         return df
-    except Exception as e:
+    except:
         return pd.DataFrame()
 
-# --- MOTOR DE CÁLCULO FINANCEIRO ---
-def calcular_estrategia(data, params):
+def calcular_resultado(data, params):
     ticker = params['ticker']
     qtde = params['qtde']
-    posicao = params['posicao'] # 'Comprado' ou 'Vendido'
-    tipo = params['tipo']       # 'Call', 'Put', 'Straddle'
-    premio_pct_perna = params['premio_pct'] / 100.0
-    strike_offset_pct = params['strike_offset'] / 100.0
-    dias_hold = params['dias_hold']
+    posicao = params['posicao']
+    tipo = params['tipo']
+    dias = params['dias']
+    premio_pct = params['premio_pct'] / 100.0
+    offset_pct = params['offset_pct'] / 100.0
     
-    # Parâmetros de Custo B3
-    taxa_entrada = 0.005  # 0.5% sobre o prêmio
-    taxa_exercicio = 0.005 # 0.5% sobre o strike
+    # Custos B3
+    taxa_entrada = 0.005
+    taxa_exercicio = 0.005
     ir_aliquota = 0.15
     
-    col_preco = 'Close'
-    if 'Close' not in data.columns:
-        col_preco = 'Adj Close' if 'Adj Close' in data.columns else None
-    
-    if not col_preco: return None, "Coluna de preço não encontrada."
+    # Validação Coluna
+    col = 'Close' if 'Close' in data.columns else 'Adj Close'
+    if col not in data.columns: return None, "Preço não encontrado"
 
-    # Filtra Período
+    # Filtro Datas
     mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
-    data_sim = data.loc[mask]
+    df_sim = data.loc[mask]
+    if df_sim.empty: return None, "Sem dados no período"
     
-    if len(data_sim) == 0: return None, "Sem dados no período."
-
-    indices_possiveis = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
+    # Índices Válidos
+    indices = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
+    if not indices: return None, "Intervalo inválido"
     
-    if not indices_possiveis: return None, "Intervalo inválido."
-
     trades = []
-    prejuizo_acumulado = 0.0
-    ultimo_idx_valido = len(data) - dias_hold
-    current_idx = indices_possiveis[0]
+    prej_acumulado = 0.0
+    limit_idx = len(data) - dias
+    curr = indices[0]
     
-    while current_idx < ultimo_idx_valido:
-        if data.index[current_idx].date() > params['fim']: break
-            
+    while curr < limit_idx:
+        if data.index[curr].date() > params['fim']: break
+        
         try:
-            # 1. Dados de Mercado (Entrada/Saída)
-            entry_date = data.index[current_idx]
-            entry_price = float(data[col_preco].iloc[current_idx])
+            # Dados Mercado
+            dt_ent = data.index[curr]
+            pr_ent = float(data[col].iloc[curr])
             
-            exit_idx = current_idx + dias_hold
-            exit_date = data.index[exit_idx]
-            exit_price = float(data[col_preco].iloc[exit_idx])
+            dt_sai = data.index[curr + dias]
+            pr_sai = float(data[col].iloc[curr + dias])
             
-            # 2. Definição Inteligente de Strikes
+            # Definição Strikes
             strike_call = 0.0
             strike_put = 0.0
             
-            # Lógica:
-            # Se for Straddle/Combo, mantém simetria (Ex: Offset 5% -> Call +5%, Put -5%)
-            # Se for Perna Única, respeita o sinal (Ex: Call -5% -> Call ITM; Put -5% -> Put OTM)
-            
-            if tipo == 'Straddle (Call + Put)':
-                offset_abs = abs(strike_offset_pct)
-                strike_call = entry_price * (1 + offset_abs)
-                strike_put = entry_price * (1 - offset_abs)
+            if tipo == 'Straddle':
+                # Simétrico
+                strike_call = pr_ent * (1 + abs(offset_pct))
+                strike_put = pr_ent * (1 - abs(offset_pct))
             else:
-                # Perna única: usa o valor exato do slider (pode ser negativo ou positivo)
-                strike_unico = entry_price * (1 + strike_offset_pct)
+                # Direcional (Respeita o sinal negativo/positivo)
+                strike_unico = pr_ent * (1 + offset_pct)
                 if tipo == 'Call': strike_call = strike_unico
                 if tipo == 'Put': strike_put = strike_unico
-
-            # 3. Definição de Pernas Ativas
-            usar_call = (tipo == 'Call' or tipo == 'Straddle (Call + Put)')
-            usar_put = (tipo == 'Put' or tipo == 'Straddle (Call + Put)')
+                
+            # Pernas Ativas
+            usa_call = (tipo == 'Call' or tipo == 'Straddle')
+            usa_put = (tipo == 'Put' or tipo == 'Straddle')
             
-            # 4. Cálculo Financeiro
-            financeiro_premio_total = 0.0
+            # 1. Custo Inicial (Prêmio Pago ou Recebido)
+            fin_premio = 0.0
+            if usa_call: fin_premio += (pr_ent * premio_pct) * qtde
+            if usa_put: fin_premio += (pr_ent * premio_pct) * qtde
             
-            if usar_call: financeiro_premio_total += (entry_price * premio_pct_perna) * qtde
-            if usar_put:  financeiro_premio_total += (entry_price * premio_pct_perna) * qtde
+            custo_ent = fin_premio * taxa_entrada
             
-            custo_entrada = financeiro_premio_total * taxa_entrada
+            # 2. Payoff Final e Exercício
+            payoff_tot = 0.0
+            custo_exe = 0.0
             
-            # 5. Payoff e Exercício
-            payoff_total = 0.0
-            custo_exercicio = 0.0
+            if usa_call:
+                val = max(0, pr_sai - strike_call)
+                payoff_tot += val * qtde
+                if pr_sai > strike_call:
+                    custo_exe += (strike_call * qtde) * taxa_exercicio
             
-            if usar_call:
-                payoff = max(0, exit_price - strike_call)
-                payoff_total += payoff * qtde
-                if exit_price > strike_call: # Exerceu Call
-                    custo_exercicio += (strike_call * qtde) * taxa_exercicio
+            if usa_put:
+                val = max(0, strike_put - pr_sai)
+                payoff_tot += val * qtde
+                if pr_sai < strike_put:
+                    custo_exe += (strike_put * qtde) * taxa_exercicio
             
-            if usar_put:
-                payoff = max(0, strike_put - exit_price)
-                payoff_total += payoff * qtde
-                if exit_price < strike_put: # Exerceu Put
-                    custo_exercicio += (strike_put * qtde) * taxa_exercicio
+            custos_tot = custo_ent + custo_exe
             
-            custos_totais = custo_entrada + custo_exercicio
-            
-            # 6. Resultado Final
-            if posicao == 'Comprado (Titular)':
-                # Ganha Payoff, Paga Prêmio + Taxas
-                res_op = payoff_total - financeiro_premio_total - custos_totais
-            else: # Vendido (Lançador)
-                # Ganha Prêmio, Paga Payoff + Taxas
-                res_op = financeiro_premio_total - payoff_total - custos_totais
-            
-            # 7. IR
-            ir = 0.0
-            if res_op > 0:
-                lucro_real = max(0, res_op - prejuizo_acumulado)
-                abatimento = res_op - lucro_real
-                prejuizo_acumulado -= abatimento
-                ir = lucro_real * ir_aliquota
+            # 3. Resultado
+            if posicao == 'Comprado':
+                res = payoff_tot - fin_premio - custos_tot
             else:
-                prejuizo_acumulado += abs(res_op)
+                res = fin_premio - payoff_tot - custos_tot
+                
+            # 4. IR
+            ir = 0.0
+            if res > 0:
+                base = max(0, res - prej_acumulado)
+                prej_acumulado -= (res - base)
+                ir = base * ir_aliquota
+            else:
+                prej_acumulado += abs(res)
+                
+            liq = res - ir
             
-            liquido = res_op - ir
+            # Strike para exibição
+            strike_show = strike_call if tipo == 'Call' else (strike_put if tipo == 'Put' else 0)
             
-            # Determina qual strike exibir na tabela
-            strike_display = 0.0
-            if tipo == 'Call': strike_display = strike_call
-            elif tipo == 'Put': strike_display = strike_put
-            else: strike_display = 0.0 # Straddle mostra 0 ou tratamos visualmente depois
-
             trades.append({
-                'Entrada': entry_date,
-                'Preço Ent.': entry_price,
-                'Strike': strike_display, # Coluna Nova
-                'Saída': exit_date,
-                'Preço Sai.': exit_price,
-                'Prêmio': financeiro_premio_total,
-                'Custos': custos_totais,
-                'Res. Oper.': res_op,
-                'IR': ir,
-                'Líquido': liquido
+                'Entrada': dt_ent, 'Pr_Ent': pr_ent, 'Strike': strike_show,
+                'Saida': dt_sai, 'Pr_Sai': pr_sai,
+                'Premio': fin_premio, 'Custos': custos_tot,
+                'Res_Op': res, 'IR': ir, 'Liquido': liq
             })
             
-        except Exception: pass
-        
-        current_idx += dias_hold
+        except: pass
+        curr += dias
         
     return pd.DataFrame(trades), None
 
 # --- INTERFACE ---
-
 st.sidebar.header("⚙️ Configuração")
 
-# 1. Inputs Básicos
 ticker = st.sidebar.text_input("Ticker", "PETR4.SA").upper().strip()
-qtde = st.sidebar.number_input("Lote (Qtde)", min_value=100, value=1000, step=100)
+qtde = st.sidebar.number_input("Lote", 100, 100000, 1000, step=100)
 
-# 2. Estratégia
 st.sidebar.markdown("---")
-tipo = st.sidebar.selectbox("Tipo de Opção", ['Call', 'Put', 'Straddle (Call + Put)'])
-posicao = st.sidebar.selectbox("Sua Posição", ['Comprado (Titular)', 'Vendido (Lançador)'])
+tipo = st.sidebar.selectbox("Estratégia", ['Call', 'Put', 'Straddle'])
+posicao = st.sidebar.selectbox("Posição", ['Comprado', 'Vendido'])
 
-# 3. Janela Temporal
+# DATA
 st.sidebar.markdown("---")
 c1, c2 = st.sidebar.columns(2)
-inicio = c1.date_input("Início", date.today() - timedelta(days=365))
+ini = c1.date_input("Início", date.today() - timedelta(days=365))
 fim = c2.date_input("Fim", date.today())
 
-# 4. Parâmetros Avançados
+# PARÂMETROS OPÇÃO
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Parâmetros da Opção**")
+st.sidebar.caption("Parâmetros da Opção")
 
-dias_hold = st.sidebar.slider("Dias até Vencimento", 5, 90, 20)
-premio_pct = st.sidebar.slider("Prêmio p/ Perna (% do Ativo)", 0.1, 15.0, 3.0, step=0.1, help="Quanto custa cada opção em % do preço da ação hoje.")
+# Reorganizei a ordem para o Strike aparecer antes do Prazo (fica mais visível)
+offset = st.sidebar.slider("Strike vs Preço Atual (%)", -20.0, 20.0, 0.0, 0.5, help="0% = ATM. Positivo = Acima. Negativo = Abaixo.")
+premio = st.sidebar.slider("Prêmio p/ Perna (%)", 0.1, 10.0, 3.0, 0.1)
+dias = st.sidebar.slider("Dias Vencimento", 5, 60, 20)
 
-# SLIDER IMPORTANTE: Strike Relativo
-strike_offset = st.sidebar.slider(
-    "Strike vs Preço Atual (%)", 
-    -30.0, 30.0, 0.0, step=0.5,
-    help="Negativo = Strike Abaixo do Preço. Positivo = Strike Acima do Preço. (No Straddle, define o intervalo)."
-)
-
-# Botão
-if st.sidebar.button("🚀 Simular Estratégia", type="primary"):
-    if inicio >= fim:
-        st.error("Data final deve ser maior que inicial.")
+if st.sidebar.button("🚀 Simular", type="primary"):
+    with st.spinner(f"Processando {ticker}..."):
+        df_dados = baixar_dados(ticker, ini, fim)
+        
+    if df_dados.empty:
+        st.error("Erro ao baixar dados.")
     else:
-        with st.spinner(f"Processando {ticker}..."):
-            df_dados = baixar_dados(ticker, inicio, fim)
-            
-        if df_dados.empty:
-            st.error("Dados não encontrados.")
+        params = {
+            'ticker': ticker, 'qtde': qtde, 'posicao': posicao,
+            'tipo': tipo, 'inicio': ini, 'fim': fim,
+            'dias': dias, 'premio_pct': premio, 'offset_pct': offset
+        }
+        
+        df, erro = calcular_resultado(df_dados, params)
+        
+        if erro: st.warning(erro)
+        elif df.empty: st.warning("Nenhuma operação gerada.")
         else:
-            params = {
-                'ticker': ticker, 'qtde': qtde, 'posicao': posicao, 'tipo': tipo,
-                'inicio': inicio, 'fim': fim, 'dias_hold': dias_hold,
-                'premio_pct': premio_pct, 'strike_offset': strike_offset
-            }
+            # DASHBOARD
+            tot_liq = df['Liquido'].sum()
+            tot_cus = df['Custos'].sum()
+            win = (len(df[df['Res_Op'] > 0]) / len(df)) * 100
             
-            df_res, erro = calcular_estrategia(df_dados, params)
+            cor = "positive" if tot_liq > 0 else "negative"
             
-            if erro: st.warning(erro)
-            elif df_res.empty: st.warning("Nenhuma operação gerada.")
-            else:
-                # --- RESULTADOS ---
-                custo_txt = f"{premio_pct}%" if tipo != 'Straddle (Call + Put)' else f"{premio_pct*2:.1f}% (Total)"
-                st.subheader(f"Resultado: {ticker} | {tipo} ({posicao})")
-                st.caption(f"Strike Offset: {strike_offset}% | Custo: {custo_txt} | Prazo: {dias_hold} dias")
-                
-                tot_liq = df_res['Líquido'].sum()
-                tot_custos = df_res['Custos'].sum()
-                tot_ir = df_res['IR'].sum()
-                win_rate = (len(df_res[df_res['Res. Oper.'] > 0]) / len(df_res)) * 100
-                
-                cor = "positive" if tot_liq > 0 else "negative"
-                
-                # Cards
-                st.markdown(f"""
-                <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px;">
-                    <div class="metric-card" style="flex: 1;">
-                        <div class="metric-label">Líquido Final</div>
-                        <div class="metric-value {cor}">R$ {tot_liq:,.2f}</div>
-                    </div>
-                    <div class="metric-card" style="flex: 1;">
-                        <div class="metric-label">Custos Totais</div>
-                        <div class="metric-value warning">R$ {tot_custos:,.2f}</div>
-                    </div>
-                    <div class="metric-card" style="flex: 1;">
-                        <div class="metric-label">IR (15%)</div>
-                        <div class="metric-value negative">R$ {tot_ir:,.2f}</div>
-                    </div>
-                    <div class="metric-card" style="flex: 1;">
-                        <div class="metric-label">Win Rate</div>
-                        <div class="metric-value neutral">{win_rate:.1f}%</div>
-                    </div>
+            st.markdown(f"""
+            <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
+                <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Resultado Líquido</div>
+                    <div class="metric-value {cor}">R$ {tot_liq:,.2f}</div>
                 </div>
-                """, unsafe_allow_html=True)
-                
-                # Tabela
-                st.markdown("### 📋 Detalhamento")
-                
-                cols = ['Entrada', 'Preço Ent.', 'Strike', 'Saída', 'Preço Sai.', 'Prêmio', 'Custos', 'Res. Oper.', 'Líquido']
-                df_show = df_res[cols].copy()
-                
-                # Se for Straddle, a coluna Strike fica confusa (são 2 strikes), então zeramos visualmente ou removemos
-                if tipo == 'Straddle (Call + Put)':
-                    df_show.drop(columns=['Strike'], inplace=True)
-                
-                # Formatação datas
-                df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%Y')
-                df_show['Saída'] = df_show['Saída'].dt.strftime('%d/%m/%Y')
-                
-                # Formatação Moeda
-                f_moeda = lambda x: f"R$ {x:,.2f}"
-                cols_moeda = [c for c in df_show.columns if c not in ['Entrada', 'Saída']]
-                
-                st.dataframe(
-                    df_show.style.format({c: f_moeda for c in cols_moeda})
-                           .map(lambda x: 'color: green' if x > 0 else 'color: red', subset=['Res. Oper.', 'Líquido']),
-                    use_container_width=True,
-                    height=500
-                )
-                
-                # Download
-                csv = df_res.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download CSV", csv, "backtest_opcoes.csv", "text/csv")
+                <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Custos Totais</div>
+                    <div class="metric-value warning">R$ {tot_cus:,.2f}</div>
+                </div>
+                 <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Win Rate</div>
+                    <div class="metric-value">{win:.1f}%</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # TABELA
+            cols = ['Entrada', 'Pr_Ent', 'Strike', 'Saida', 'Pr_Sai', 'Premio', 'Custos', 'Res_Op', 'Liquido']
+            df_show = df[cols].copy()
+            
+            # Remove Strike visual se for Straddle
+            if tipo == 'Straddle': df_show.drop(columns=['Strike'], inplace=True)
+            
+            # Formatação
+            fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Strike', 'Pr_Sai', 'Premio', 'Custos', 'Res_Op', 'Liquido'] if c in df_show.columns}
+            df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%y')
+            df_show['Saida'] = df_show['Saida'].dt.strftime('%d/%m/%y')
+            
+            st.dataframe(
+                df_show.style.format(fmt).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Res_Op', 'Liquido']),
+                use_container_width=True,
+                height=500
+            )
