@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 from datetime import date, timedelta
 import warnings
+import io # Necessário para criar o arquivo Excel na memória
 
 # --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(
@@ -181,6 +182,32 @@ def calcular_estrategia_multipla(data, params):
         
     return pd.DataFrame(trades), None
 
+# --- FUNÇÃO PARA GERAR EXCEL FORMATADO ---
+def to_excel_formatado(df):
+    output = io.BytesIO()
+    # Usa o engine xlsxwriter para permitir formatação avançada
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Resultado')
+        workbook = writer.book
+        worksheet = writer.sheets['Resultado']
+        
+        # Formatos
+        money_fmt = workbook.add_format({'num_format': 'R$ #,##0.00'})
+        date_fmt = workbook.add_format({'num_format': 'dd/mm/yyyy'})
+        
+        # Aplica formatação nas colunas
+        # Colunas de Data (A e D geralmente, mas vamos pelo nome)
+        for i, col in enumerate(df.columns):
+            # Define largura padrão
+            worksheet.set_column(i, i, 15)
+            
+            if col in ['Entrada', 'Saida']:
+                worksheet.set_column(i, i, 12, date_fmt)
+            elif col in ['Pr_Ent', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']:
+                worksheet.set_column(i, i, 18, money_fmt)
+                
+    return output.getvalue()
+
 # --- INTERFACE ---
 st.sidebar.header("🔧 Montador de Estratégia")
 
@@ -274,16 +301,33 @@ if st.sidebar.button("🚀 Simular Combinação", type="primary"):
             </div>
             """, unsafe_allow_html=True)
             
-            # Tabela
+            # Seleção de Colunas
             cols = ['Entrada', 'Pr_Ent', 'Strikes', 'Saida', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']
+            
+            # --- EXIBIÇÃO NA TELA (STREAMLIT) ---
+            # Aqui criamos uma cópia formatada em TEXTO apenas para exibição
+            df_display = df[cols].copy()
             fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']}
             
-            df_show = df[cols].copy()
-            df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%y')
-            df_show['Saida'] = df_show['Saida'].dt.strftime('%d/%m/%y')
+            # Formata datas como texto para ficar bonito na tela
+            df_display['Entrada'] = df_display['Entrada'].dt.strftime('%d/%m/%Y')
+            df_display['Saida'] = df_display['Saida'].dt.strftime('%d/%m/%Y')
             
             st.dataframe(
-                df_show.style.format(fmt).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Res_Op', 'Liquido']),
+                df_display.style.format(fmt).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Res_Op', 'Liquido']),
                 use_container_width=True,
                 height=500
+            )
+
+            # --- BOTÃO DE DOWNLOAD EXCEL FORMATADO ---
+            # Aqui usamos o DF original (com números e datas reais) e aplicamos formatação do Excel
+            df_excel = df[cols].copy() # Pega os dados originais (numéricos)
+            
+            excel_data = to_excel_formatado(df_excel)
+            
+            st.download_button(
+                label="📥 Baixar Planilha Excel (.xlsx)",
+                data=excel_data,
+                file_name=f"resultado_{ticker}_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
