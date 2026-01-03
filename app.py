@@ -6,7 +6,7 @@ import warnings
 
 # --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(
-    page_title="Simulador de Opções (Builder)",
+    page_title="Simulador de Opções (Builder + CDI)",
     page_icon="🔧",
     layout="wide"
 )
@@ -38,10 +38,30 @@ st.markdown("""
     .positive { color: #28a745; }
     .negative { color: #dc3545; }
     .warning { color: #ffc107; }
+    .info { color: #17a2b8; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- FUNÇÕES ---
+
+@st.cache_data(ttl=86400)
+def pegar_cdi_bcb():
+    """Baixa o histórico do CDI (Série 12) do Banco Central"""
+    try:
+        url = 'http://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?formato=csv'
+        df = pd.read_csv(url, sep=';')
+        
+        # Tratamento de dados
+        df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
+        df['valor'] = df['valor'].str.replace(',', '.').astype(float)
+        
+        # Fator diário: 1 + (taxa/100)
+        df['fator'] = 1 + (df['valor'] / 100)
+        df.set_index('data', inplace=True)
+        return df[['fator']]
+    except:
+        return pd.DataFrame()
+
 @st.cache_data(ttl=3600)
 def baixar_dados(ticker, inicio, fim):
     try:
@@ -86,9 +106,9 @@ def calcular_leg(pr_ent, pr_sai, qtde, tipo, posicao, offset_pct, premio_pct):
         
     fin_payoff = payoff_un * qtde
     
-    # 4. Custos Operacionais (B3 + Corretagem Estimada)
+    # 4. Custos Operacionais
     taxa_entrada = 0.005 # 0.5% sobre prêmio
-    taxa_exercicio = 0.005 # 0.5% sobre strike (pesado!)
+    taxa_exercicio = 0.005 # 0.5% sobre strike
     
     custo_ent = fin_premio * taxa_entrada
     custo_sai = (strike * qtde * taxa_exercicio) if exercido else 0.0
@@ -98,19 +118,17 @@ def calcular_leg(pr_ent, pr_sai, qtde, tipo, posicao, offset_pct, premio_pct):
     resultado = 0.0
     
     if posicao == 'Comprado':
-        # Sai Prêmio, Entra Payoff
         resultado = fin_payoff - fin_premio - custos_totais
     else: # Vendido
-        # Entra Prêmio, Sai Payoff
         resultado = fin_premio - fin_payoff - custos_totais
         
     return resultado, fin_premio, custos_totais, strike
 
-def calcular_estrategia_multipla(data, params):
+def calcular_estrategia_multipla(data, params, df_cdi):
     ticker = params['ticker']
     qtde = params['qtde']
     dias = params['dias']
-    legs = params['legs'] # Lista de dicionários com config das pernas
+    legs = params['legs'] 
     
     ir_aliquota = 0.15
     col = 'Close' if 'Close' in data.columns else 'Adj Close'
@@ -134,20 +152,20 @@ def calcular_estrategia_multipla(data, params):
             dt_sai = data.index[curr + dias]
             pr_sai = float(data[col].iloc[curr + dias])
             
-            res_total = 0.0
+            res_op_total = 0.0
             custos_total = 0.0
-            premio_net = 0.0 # Positivo = Recebeu, Negativo = Pagou
+            premio_net = 0.0 # Fluxo Inicial (Positivo = Recebeu, Negativo = Pagou)
             
             str_strikes = []
             
-            # Itera sobre as pernas ativas
+            # Itera sobre as pernas
             for leg in legs:
                 r, p_val, c, k = calcular_leg(
                     pr_ent, pr_sai, qtde, 
                     leg['tipo'], leg['posicao'], leg['offset'], leg['premio']
                 )
                 
-                res_total += r
+                res_op_total += r
                 custos_total += c
                 str_strikes.append(f"{leg['tipo'][0]}{k:.2f}")
                 
@@ -156,24 +174,39 @@ def calcular_estrategia_multipla(data, params):
                 else:
                     premio_net -= p_val
             
-            # IR
+            # --- CÁLCULO DO CDI SOBRE O FLUXO INICIAL ---
+            res_cdi = 0.0
+            if not df_cdi.empty:
+                # Filtra o CDI apenas durante a vigência do trade
+                mask_cdi = (df_cdi.index >= dt_ent) & (df_cdi.index < dt_sai)
+                if not df_cdi[mask_cdi].empty:
+                    fator_acumulado = df_cdi.loc[mask_cdi, 'fator'].prod()
+                    # Fórmula: Fluxo Inicial * (Fator - 1)
+                    # Se Fluxo positivo (Venda): Ganha rendimento
+                    # Se Fluxo negativo (Compra): Custo de oportunidade (negativo)
+                    res_cdi = premio_net * (fator_acumulado - 1)
+
+            # IR (Calculado sobre o Operacional)
             ir = 0.0
-            if res_total > 0:
-                base = max(0, res_total - prej_acumulado)
-                prej_acumulado -= (res_total - base)
+            if res_op_total > 0:
+                base = max(0, res_op_total - prej_acumulado)
+                prej_acumulado -= (res_op_total - base)
                 ir = base * ir_aliquota
             else:
-                prej_acumulado += abs(res_total)
-                
-            liq = res_total - ir
+                prej_acumulado += abs(res_op_total)
+            
+            # Líquido Final = Resultado Opções + Resultado CDI - IR
+            liq = res_op_total + res_cdi - ir
             
             trades.append({
                 'Entrada': dt_ent, 'Pr_Ent': pr_ent, 
                 'Saida': dt_sai, 'Pr_Sai': pr_sai,
                 'Strikes': " / ".join(str_strikes),
-                'Fluxo Inicial': premio_net, # Quanto pagou ou recebeu na montagem
+                'Fluxo Inicial': premio_net, 
+                'Res. CDI': res_cdi,    # Coluna Nova
                 'Custos': custos_total,
-                'Res_Op': res_total, 'Liquido': liq
+                'Res_Op': res_op_total, # Resultado Puro Opções
+                'Liquido': liq
             })
             
         except Exception as e: pass
@@ -183,6 +216,10 @@ def calcular_estrategia_multipla(data, params):
 
 # --- INTERFACE ---
 st.sidebar.header("🔧 Montador de Estratégia")
+
+# Carrega CDI no início
+with st.spinner("Carregando CDI do Banco Central..."):
+    df_cdi = pegar_cdi_bcb()
 
 ticker = st.sidebar.text_input("Ticker", "PETR4.SA").upper().strip()
 qtde = st.sidebar.number_input("Lote (Qtde)", 100, 100000, 1000, 100)
@@ -207,7 +244,7 @@ if usar_p2:
     st.sidebar.markdown("### 🔵 Perna 2 (Secundária)")
     c1_p2, c2_p2 = st.sidebar.columns(2)
     tipo_p2 = c1_p2.selectbox("Tipo P2", ['Call', 'Put'], key='t2')
-    pos_p2 = c2_p2.selectbox("Ação P2", ['Comprado', 'Vendido'], key='p2', index=1) # Padrão Vendido para facilitar Travas
+    pos_p2 = c2_p2.selectbox("Ação P2", ['Comprado', 'Vendido'], key='p2', index=1)
     off_p2 = st.sidebar.slider("Strike P2 vs Preço (%)", -20.0, 20.0, 5.0, 0.5, key='o2')
     pre_p2 = st.sidebar.slider("Custo P2 (% do Ativo)", 0.1, 10.0, 1.5, 0.1, key='c2')
 
@@ -244,7 +281,7 @@ if st.sidebar.button("🚀 Simular Combinação", type="primary"):
             'inicio': dt_ini, 'fim': dt_fim, 'legs': legs_config
         }
         
-        df, erro = calcular_estrategia_multipla(df_dados, params)
+        df, erro = calcular_estrategia_multipla(df_dados, params, df_cdi)
         
         if erro: st.warning(erro)
         elif df.empty: st.warning("Nenhuma operação.")
@@ -252,8 +289,12 @@ if st.sidebar.button("🚀 Simular Combinação", type="primary"):
             # Cards
             tot_liq = df['Liquido'].sum()
             tot_cust = df['Custos'].sum()
+            tot_cdi = df['Res. CDI'].sum() # SOMA SOLICITADA
+            
             win = (len(df[df['Res_Op'] > 0]) / len(df)) * 100
+            
             cor = "positive" if tot_liq > 0 else "negative"
+            cor_cdi = "positive" if tot_cdi > 0 else "negative"
             
             st.subheader(f"Resultado: {desc_estrat}")
             
@@ -262,6 +303,10 @@ if st.sidebar.button("🚀 Simular Combinação", type="primary"):
                 <div class="metric-card" style="flex: 1;">
                     <div class="metric-label">Resultado Líquido</div>
                     <div class="metric-value {cor}">R$ {tot_liq:,.2f}</div>
+                </div>
+                <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Fluxo Inicial (CDI)</div>
+                    <div class="metric-value {cor_cdi}">R$ {tot_cdi:,.2f}</div>
                 </div>
                 <div class="metric-card" style="flex: 1;">
                     <div class="metric-label">Custos Operacionais</div>
@@ -275,15 +320,15 @@ if st.sidebar.button("🚀 Simular Combinação", type="primary"):
             """, unsafe_allow_html=True)
             
             # Tabela
-            cols = ['Entrada', 'Pr_Ent', 'Strikes', 'Saida', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']
-            fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']}
+            cols = ['Entrada', 'Pr_Ent', 'Strikes', 'Saida', 'Pr_Sai', 'Fluxo Inicial', 'Res. CDI', 'Custos', 'Res_Op', 'Liquido']
+            fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Pr_Sai', 'Fluxo Inicial', 'Res. CDI', 'Custos', 'Res_Op', 'Liquido']}
             
             df_show = df[cols].copy()
             df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%y')
             df_show['Saida'] = df_show['Saida'].dt.strftime('%d/%m/%y')
             
             st.dataframe(
-                df_show.style.format(fmt).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Res_Op', 'Liquido']),
+                df_show.style.format(fmt).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Res_Op', 'Liquido', 'Res. CDI']),
                 use_container_width=True,
                 height=500
             )
