@@ -6,14 +6,14 @@ import warnings
 
 # --- CONFIGURAÇÃO INICIAL ---
 st.set_page_config(
-    page_title="Opções vs Renda Fixa",
-    page_icon="💰",
+    page_title="Simulador de Opções (Builder)",
+    page_icon="🔧",
     layout="wide"
 )
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-# --- ESTILO CSS (Visual Limpo) ---
+# --- ESTILO CSS ---
 st.markdown("""
 <style>
     .metric-card {
@@ -31,42 +31,25 @@ st.markdown("""
         font-weight: 600;
     }
     .metric-value {
-        font-size: 28px;
+        font-size: 26px;
         font-weight: bold;
         margin-top: 5px;
     }
     .positive { color: #28a745; }
     .negative { color: #dc3545; }
-    .neutral { color: #6c757d; }
-    .info { color: #17a2b8; }
+    .warning { color: #ffc107; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- FUNÇÕES ---
-
-@st.cache_data(ttl=86400)
-def pegar_cdi_bcb():
-    """Baixa CDI diário do Banco Central"""
-    try:
-        url = 'http://api.bcb.gov.br/dados/serie/bcdata.sgs.12/dados?formato=csv'
-        df = pd.read_csv(url, sep=';')
-        df['data'] = pd.to_datetime(df['data'], format='%d/%m/%Y')
-        df['valor'] = df['valor'].str.replace(',', '.').astype(float)
-        # Fator diário = 1 + (taxa/100)
-        df['fator'] = 1 + (df['valor'] / 100)
-        df.set_index('data', inplace=True)
-        return df[['fator']]
-    except:
-        return pd.DataFrame()
-
 @st.cache_data(ttl=3600)
 def baixar_dados(ticker, inicio, fim):
     try:
         fim_ajustado = fim + timedelta(days=200)
         df = yf.download(ticker, start=inicio, end=fim_ajustado, progress=False, auto_adjust=False)
+        
         if df.empty: return pd.DataFrame()
         
-        # Limpeza MultiIndex
         if isinstance(df.columns, pd.MultiIndex):
             try:
                 df.columns = df.columns.get_level_values('Price')
@@ -75,15 +58,22 @@ def baixar_dados(ticker, inicio, fim):
         
         if df.index.tz is not None:
             df.index = df.index.tz_localize(None)
+            
         return df
     except:
         return pd.DataFrame()
 
 def calcular_leg(pr_ent, pr_sai, qtde, tipo, posicao, offset_pct, premio_pct):
+    """Calcula o resultado financeiro de uma única perna"""
+    
+    # 1. Definição do Strike
     strike = pr_ent * (1 + offset_pct/100.0)
+    
+    # 2. Custo Inicial (Prêmio)
     premio_un = pr_ent * (premio_pct/100.0)
     fin_premio = premio_un * qtde
     
+    # 3. Payoff (Valor no Vencimento)
     payoff_un = 0.0
     exercido = False
     
@@ -96,184 +86,204 @@ def calcular_leg(pr_ent, pr_sai, qtde, tipo, posicao, offset_pct, premio_pct):
         
     fin_payoff = payoff_un * qtde
     
-    # Taxas: 0.5% entrada (premio) + 0.5% saida (strike se exercido)
-    taxa_ent = fin_premio * 0.005
-    taxa_sai = (strike * qtde * 0.005) if exercido else 0.0
-    custos = taxa_ent + taxa_sai
+    # 4. Custos Operacionais (B3 + Corretagem Estimada)
+    taxa_entrada = 0.005 # 0.5% sobre prêmio
+    taxa_exercicio = 0.005 # 0.5% sobre strike (pesado!)
     
-    res = (fin_payoff - fin_premio - custos) if posicao == 'Comprado' else (fin_premio - fin_payoff - custos)
+    custo_ent = fin_premio * taxa_entrada
+    custo_sai = (strike * qtde * taxa_exercicio) if exercido else 0.0
+    custos_totais = custo_ent + custo_sai
     
-    return res, custos
+    # 5. Resultado da Perna
+    resultado = 0.0
+    
+    if posicao == 'Comprado':
+        # Sai Prêmio, Entra Payoff
+        resultado = fin_payoff - fin_premio - custos_totais
+    else: # Vendido
+        # Entra Prêmio, Sai Payoff
+        resultado = fin_premio - fin_payoff - custos_totais
+        
+    return resultado, fin_premio, custos_totais, strike
 
-def simular_comparativo(data, params, df_cdi):
-    capital_atual_estrat = params['capital'] # Começa com R$ X
+def calcular_estrategia_multipla(data, params):
+    ticker = params['ticker']
+    qtde = params['qtde']
+    dias = params['dias']
+    legs = params['legs'] # Lista de dicionários com config das pernas
     
-    # Cria a curva do CDI (Universo B)
-    # Se df_cdi existir, filtramos pelo período e calculamos o acumulado
-    fator_acumulado_cdi = 1.0
-    if not df_cdi.empty:
-        # Pega CDI desde o início até o fim da simulação
-        mask_cdi = (df_cdi.index >= pd.to_datetime(params['inicio'])) & (df_cdi.index <= pd.to_datetime(params['fim']))
-        fator_acumulado_cdi = df_cdi.loc[mask_cdi, 'fator'].prod()
-    
-    capital_final_cdi = params['capital'] * fator_acumulado_cdi
-    
-    # Simula a Estratégia (Universo A)
-    trades = []
-    prej_acumulado = 0.0
-    
+    ir_aliquota = 0.15
     col = 'Close' if 'Close' in data.columns else 'Adj Close'
+    
+    mask = (data.index.date >= params['inicio']) & (data.index.date <= params['fim'])
     indices = [i for i, dt in enumerate(data.index) if dt.date() >= params['inicio'] and dt.date() <= params['fim']]
     
     if not indices: return None, "Intervalo inválido"
     
+    trades = []
+    prej_acumulado = 0.0
+    limit_idx = len(data) - dias
     curr = indices[0]
-    limit = len(data) - params['dias']
     
-    while curr < limit:
+    while curr < limit_idx:
         if data.index[curr].date() > params['fim']: break
+        
         try:
-            # Dados Trade
             dt_ent = data.index[curr]
-            dt_sai = data.index[curr + params['dias']]
             pr_ent = float(data[col].iloc[curr])
-            pr_sai = float(data[col].iloc[curr + params['dias']] )
+            dt_sai = data.index[curr + dias]
+            pr_sai = float(data[col].iloc[curr + dias])
             
-            res_bruto_trade = 0.0
-            custos_trade = 0.0
+            res_total = 0.0
+            custos_total = 0.0
+            premio_net = 0.0 # Positivo = Recebeu, Negativo = Pagou
             
-            # Calcula Pernas
-            for leg in params['legs']:
-                r, c = calcular_leg(pr_ent, pr_sai, params['qtde'], leg['tipo'], leg['posicao'], leg['offset'], leg['premio'])
-                res_bruto_trade += r
-                custos_trade += c
+            str_strikes = []
+            
+            # Itera sobre as pernas ativas
+            for leg in legs:
+                r, p_val, c, k = calcular_leg(
+                    pr_ent, pr_sai, qtde, 
+                    leg['tipo'], leg['posicao'], leg['offset'], leg['premio']
+                )
+                
+                res_total += r
+                custos_total += c
+                str_strikes.append(f"{leg['tipo'][0]}{k:.2f}")
+                
+                if leg['posicao'] == 'Vendido':
+                    premio_net += p_val
+                else:
+                    premio_net -= p_val
             
             # IR
             ir = 0.0
-            if res_bruto_trade > 0:
-                base = max(0, res_bruto_trade - prej_acumulado)
-                prej_acumulado -= (res_bruto_trade - base)
-                ir = base * 0.15
+            if res_total > 0:
+                base = max(0, res_total - prej_acumulado)
+                prej_acumulado -= (res_total - base)
+                ir = base * ir_aliquota
             else:
-                prej_acumulado += abs(res_bruto_trade)
-            
-            liq_trade = res_bruto_trade - ir
-            
-            # Atualiza o Capital da Estratégia (Juros Simples sobre o saldo anterior ou apenas soma ao caixa)
-            # Modelo: O lucro entra no caixa, o prejuízo sai do caixa.
-            capital_atual_estrat += liq_trade
+                prej_acumulado += abs(res_total)
+                
+            liq = res_total - ir
             
             trades.append({
-                'Data Saída': dt_sai,
-                'Resultado Op.': liq_trade,
-                'Saldo Acumulado': capital_atual_estrat
+                'Entrada': dt_ent, 'Pr_Ent': pr_ent, 
+                'Saida': dt_sai, 'Pr_Sai': pr_sai,
+                'Strikes': " / ".join(str_strikes),
+                'Fluxo Inicial': premio_net, # Quanto pagou ou recebeu na montagem
+                'Custos': custos_total,
+                'Res_Op': res_total, 'Liquido': liq
             })
             
-        except: pass
-        curr += params['dias']
-    
-    return {
-        'saldo_opcoes': capital_atual_estrat,
-        'saldo_cdi': capital_final_cdi,
-        'trades': pd.DataFrame(trades)
-    }, None
+        except Exception as e: pass
+        curr += dias
+        
+    return pd.DataFrame(trades), None
 
 # --- INTERFACE ---
-st.sidebar.header("🔧 Configuração")
+st.sidebar.header("🔧 Montador de Estratégia")
 
-with st.spinner("Carregando CDI..."):
-    df_cdi = pegar_cdi_bcb()
-
-# Inputs
 ticker = st.sidebar.text_input("Ticker", "PETR4.SA").upper().strip()
-capital = st.sidebar.number_input("Capital Inicial (R$)", 1000.0, 1000000.0, 50000.0, 1000.0)
-qtde = st.sidebar.number_input("Lote Opções", 100, 100000, 1000, 100)
-dias = st.sidebar.slider("Vencimento (Dias)", 5, 60, 20)
+qtde = st.sidebar.number_input("Lote (Qtde)", 100, 100000, 1000, 100)
+dias = st.sidebar.slider("Dias Úteis (Vencimento)", 5, 60, 20)
 
 st.sidebar.markdown("---")
-c1, c2 = st.sidebar.columns(2)
-t1 = c1.selectbox("Tipo P1", ['Call', 'Put'], key='t1')
-p1 = c2.selectbox("Ação P1", ['Comprado', 'Vendido'], key='p1')
-o1 = st.sidebar.slider("Strike P1 (%)", -20.0, 20.0, 0.0, 0.5, key='o1')
-pr1 = st.sidebar.slider("Custo P1 (%)", 0.1, 10.0, 3.0, 0.1, key='c1')
 
+# --- PERNA 1 ---
+st.sidebar.markdown("### 🟢 Perna 1 (Principal)")
+c1_p1, c2_p1 = st.sidebar.columns(2)
+tipo_p1 = c1_p1.selectbox("Tipo P1", ['Call', 'Put'], key='t1')
+pos_p1 = c2_p1.selectbox("Ação P1", ['Comprado', 'Vendido'], key='p1')
+off_p1 = st.sidebar.slider("Strike P1 vs Preço (%)", -20.0, 20.0, 0.0, 0.5, key='o1')
+pre_p1 = st.sidebar.slider("Custo P1 (% do Ativo)", 0.1, 10.0, 3.0, 0.1, key='c1')
+
+# --- PERNA 2 ---
 st.sidebar.markdown("---")
-use_p2 = st.sidebar.checkbox("Perna 2")
-t2, p2, o2, pr2 = None, None, 0.0, 0.0
-if use_p2:
-    c3, c4 = st.sidebar.columns(2)
-    t2 = c3.selectbox("Tipo P2", ['Call', 'Put'], key='t2')
-    p2 = c4.selectbox("Ação P2", ['Comprado', 'Vendido'], key='p2', index=1)
-    o2 = st.sidebar.slider("Strike P2 (%)", -20.0, 20.0, 5.0, 0.5, key='o2')
-    pr2 = st.sidebar.slider("Custo P2 (%)", 0.1, 10.0, 1.5, 0.1, key='c2')
+usar_p2 = st.sidebar.checkbox("Adicionar Perna 2 (Combinada)")
+tipo_p2, pos_p2, off_p2, pre_p2 = None, None, 0.0, 0.0
 
+if usar_p2:
+    st.sidebar.markdown("### 🔵 Perna 2 (Secundária)")
+    c1_p2, c2_p2 = st.sidebar.columns(2)
+    tipo_p2 = c1_p2.selectbox("Tipo P2", ['Call', 'Put'], key='t2')
+    pos_p2 = c2_p2.selectbox("Ação P2", ['Comprado', 'Vendido'], key='p2', index=1) # Padrão Vendido para facilitar Travas
+    off_p2 = st.sidebar.slider("Strike P2 vs Preço (%)", -20.0, 20.0, 5.0, 0.5, key='o2')
+    pre_p2 = st.sidebar.slider("Custo P2 (% do Ativo)", 0.1, 10.0, 1.5, 0.1, key='c2')
+
+# --- DATAS ---
 st.sidebar.markdown("---")
-ini = st.sidebar.date_input("Início", date.today() - timedelta(days=365*2))
-fim = st.sidebar.date_input("Fim", date.today())
+dt_ini = st.sidebar.date_input("Início", date.today() - timedelta(days=365))
+dt_fim = st.sidebar.date_input("Fim", date.today())
 
-if st.sidebar.button("🚀 Comparar Resultados", type="primary"):
-    with st.spinner("Calculando..."):
-        df_dados = baixar_dados(ticker, ini, fim)
+# --- EXECUÇÃO ---
+if st.sidebar.button("🚀 Simular Combinação", type="primary"):
+    with st.spinner("Processando..."):
+        df_dados = baixar_dados(ticker, dt_ini, dt_fim)
         
     if df_dados.empty:
         st.error("Sem dados.")
     else:
-        legs = [{'tipo': t1, 'posicao': p1, 'offset': o1, 'premio': pr1}]
-        if use_p2: legs.append({'tipo': t2, 'posicao': p2, 'offset': o2, 'premio': pr2})
+        # Monta lista de pernas
+        legs_config = [{
+            'tipo': tipo_p1, 'posicao': pos_p1, 
+            'offset': off_p1, 'premio': pre_p1
+        }]
+        
+        desc_estrat = f"{pos_p1} {tipo_p1} ({off_p1}%)"
+        
+        if usar_p2:
+            legs_config.append({
+                'tipo': tipo_p2, 'posicao': pos_p2, 
+                'offset': off_p2, 'premio': pre_p2
+            })
+            desc_estrat += f" + {pos_p2} {tipo_p2} ({off_p2}%)"
             
         params = {
-            'ticker': ticker, 'capital': capital, 'qtde': qtde, 'dias': dias,
-            'inicio': ini, 'fim': fim, 'legs': legs
+            'ticker': ticker, 'qtde': qtde, 'dias': dias,
+            'inicio': dt_ini, 'fim': dt_fim, 'legs': legs_config
         }
         
-        res, erro = simular_comparativo(df_dados, params, df_cdi)
+        df, erro = calcular_estrategia_multipla(df_dados, params)
         
         if erro: st.warning(erro)
-        elif res['trades'].empty: st.warning("Nenhuma operação gerada.")
+        elif df.empty: st.warning("Nenhuma operação.")
         else:
-            # RESULTADOS FINAIS
-            s_op = res['saldo_opcoes']
-            s_cdi = res['saldo_cdi']
+            # Cards
+            tot_liq = df['Liquido'].sum()
+            tot_cust = df['Custos'].sum()
+            win = (len(df[df['Res_Op'] > 0]) / len(df)) * 100
+            cor = "positive" if tot_liq > 0 else "negative"
             
-            # Rentabilidade %
-            rent_op = ((s_op / capital) - 1) * 100
-            rent_cdi = ((s_cdi / capital) - 1) * 100
-            diff = s_op - s_cdi
-            
-            cor_op = "positive" if rent_op > 0 else "negative"
-            cor_diff = "positive" if diff > 0 else "negative"
-            
-            st.subheader(f"Comparativo Final: R$ {capital:,.2f} aplicados em {ini.strftime('%d/%m/%Y')}")
+            st.subheader(f"Resultado: {desc_estrat}")
             
             st.markdown(f"""
-            <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 30px;">
-                <div class="metric-card" style="flex: 1; border-top: 5px solid blue;">
-                    <div class="metric-label">Saldo Opções</div>
-                    <div class="metric-value {cor_op}">R$ {s_op:,.2f}</div>
-                    <div class="metric-label" style="margin-top:10px;">Retorno: {rent_op:.1f}%</div>
+            <div style="display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px;">
+                <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Resultado Líquido</div>
+                    <div class="metric-value {cor}">R$ {tot_liq:,.2f}</div>
                 </div>
-                <div class="metric-card" style="flex: 1; border-top: 5px solid gray;">
-                    <div class="metric-label">Saldo 100% CDI</div>
-                    <div class="metric-value info">R$ {s_cdi:,.2f}</div>
-                    <div class="metric-label" style="margin-top:10px;">Retorno: {rent_cdi:.1f}%</div>
+                <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Custos Operacionais</div>
+                    <div class="metric-value warning">R$ {tot_cust:,.2f}</div>
                 </div>
-                <div class="metric-card" style="flex: 1; border-top: 5px solid {('green' if diff > 0 else 'red')};">
-                    <div class="metric-label">Diferença (Bolso)</div>
-                    <div class="metric-value {cor_diff}">R$ {diff:+,.2f}</div>
-                    <div class="metric-label" style="margin-top:10px;">Opções vs CDI</div>
+                 <div class="metric-card" style="flex: 1;">
+                    <div class="metric-label">Taxa de Acerto</div>
+                    <div class="metric-value">{win:.1f}%</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
             
-            st.markdown("### 📋 Evolução da Conta Opções")
-            df_show = res['trades'].copy()
-            df_show['Data Saída'] = pd.to_datetime(df_show['Data Saída']).dt.strftime('%d/%m/%Y')
+            # Tabela
+            cols = ['Entrada', 'Pr_Ent', 'Strikes', 'Saida', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']
+            fmt = {c: 'R$ {:.2f}' for c in ['Pr_Ent', 'Pr_Sai', 'Fluxo Inicial', 'Custos', 'Res_Op', 'Liquido']}
+            
+            df_show = df[cols].copy()
+            df_show['Entrada'] = df_show['Entrada'].dt.strftime('%d/%m/%y')
+            df_show['Saida'] = df_show['Saida'].dt.strftime('%d/%m/%y')
             
             st.dataframe(
-                df_show.style.format({
-                    'Resultado Op.': 'R$ {:.2f}',
-                    'Saldo Acumulado': 'R$ {:.2f}'
-                }).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Resultado Op.']),
+                df_show.style.format(fmt).map(lambda x: 'color: green' if x>0 else 'color: red', subset=['Res_Op', 'Liquido']),
                 use_container_width=True,
                 height=500
             )
